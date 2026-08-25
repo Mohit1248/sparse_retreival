@@ -1,6 +1,14 @@
 # Core (needed to run the harness and the shipped trivial baseline)
 pytest>=7.0
 
+# Used by submission/indexer.py's tokenize() for Porter stemming
+# (assignment Section 4.1 explicitly permits "standard libraries for
+# tokenisation/stemming, e.g., NLTK's Porter stemmer"). PorterStemmer is a
+# pure algorithm with no downloaded corpora/models, so it needs no network
+# access at build_index()/retrieve() time -- only pip installing the
+# package itself needs network, which happens at `docker build` time.
+nltk>=3.8
+
 # Available if you want to compile part of your submission as a C/C++
 # extension (e.g. via Cython) for the efficiency / index-size leaderboard
 # components — see docs/SUBMISSION_INTERFACE.md, "Compiled extensions".

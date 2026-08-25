@@ -32,24 +32,12 @@ rename them, change their signatures, or move them out of this file.
         score descending (highest score = most relevant). This is exactly
         the ranking the harness scores with nDCG@10 / MAP@10. doc_id values
         must be ones that appeared in the corpus passed to build_index().
-
-This file ships with a trivial, fully-working baseline — return the first
-k documents in the order build_index() saw them, ignoring the query
-entirely — wired up below. It actually persists to disk and reloads
-correctly, so it exercises the full build -> disk -> fresh process -> load
--> query path end-to-end from your very first commit. Its scores will be
-close to zero; replace the logic, but keep the same
-persist-in-build / reconstruct-in-load shape.
 """
-import json
-import os
 from typing import List, Optional, Tuple
 
+from submission import bm25, boolean_vsm
 from submission.corpus_utils import load_corpus
-
-# TODO(you): once implemented, import and use your real scorers, e.g.:
-# from submission import bm25, boolean_vsm, custom_scorer
-# from submission.indexer import InvertedIndex
+from submission.indexer import InvertedIndex
 
 # ---------------------------------------------------------------------------
 # Module-level state. load_index() populates this; retrieve() reads it.
@@ -58,62 +46,31 @@ from submission.corpus_utils import load_corpus
 # must be written to index_dir in build_index() and read back in
 # load_index().
 # ---------------------------------------------------------------------------
-_DOC_ORDER: Optional[List[str]] = None  # [doc_id, ...] in the order build_index() saw them
-
-_DOC_ORDER_FILENAME = "doc_order.json"  # TODO(you): replace with your real index files
+_INDEX: Optional[InvertedIndex] = None
 
 
 def build_index(corpus_path: str, index_dir: str) -> None:
-    """Load the corpus, build whatever index structures you need, and
-    write everything retrieve() will need into `index_dir`.
-
-    Runs once, in its own process, before load_index() ever runs. Heavy
-    one-time work — tokenising the whole corpus, building postings lists,
-    computing collection statistics — belongs here, not in retrieve(), so
-    it doesn't get charged against your per-query latency. Whatever you
-    don't write to `index_dir` here does not exist as far as load_index()
-    is concerned.
-    """
+    """Load the corpus, build the inverted index, and persist it to
+    index_dir so load_index() can reconstruct it in a fresh process."""
     corpus = load_corpus(corpus_path)
-
-    # TODO(you): build your real inverted index / term statistics here, e.g.:
-    #
-    #   from submission.indexer import InvertedIndex
-    #   index = InvertedIndex()
-    #   index.build(corpus)
-    #   index.save(index_dir)          # <- persist it (see indexer.py)
-    #
-    # The trivial baseline below only persists doc_id order, which is all
-    # `_baseline_retrieve` needs.
-    os.makedirs(index_dir, exist_ok=True)
-    doc_order = [doc_id for doc_id, _text in corpus]
-    with open(os.path.join(index_dir, _DOC_ORDER_FILENAME), "w", encoding="utf-8") as f:
-        json.dump(doc_order, f)
+    index = InvertedIndex()
+    index.build(corpus)
+    index.save(index_dir)
 
 
 def load_index(index_dir: str) -> None:
-    """Reconstruct everything retrieve() needs, reading only from
-    `index_dir`. Runs once, in a fresh process, before any retrieve()
-    calls — there is no leftover state from build_index() to rely on.
-    """
-    global _DOC_ORDER
-
-    # TODO(you): load your real index here, e.g.:
-    #
-    #   from submission.indexer import InvertedIndex
-    #   index = InvertedIndex.load(index_dir)
-    #   bm25.build(index)
-    #   boolean_vsm.build(index)
-    #
-    # and store it in a module-level variable so retrieve() can use it.
-    path = os.path.join(index_dir, _DOC_ORDER_FILENAME)
-    with open(path, encoding="utf-8") as f:
-        _DOC_ORDER = json.load(f)
+    """Reconstruct the index from index_dir, then hand it to each scorer
+    module's build() so they can precompute whatever they need (e.g.
+    boolean_vsm's document norms)."""
+    global _INDEX
+    _INDEX = InvertedIndex.load(index_dir)
+    boolean_vsm.build(_INDEX)
+    bm25.build(_INDEX)
 
 
 def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
-    """Return up to k (doc_id, score) pairs for `query`, best first."""
-    if _DOC_ORDER is None:
+    """Return up to k (doc_id, score) pairs for `query`, BM25-ranked."""
+    if _INDEX is None:
         raise RuntimeError(
             "retrieve() called before load_index(); the harness always "
             "calls build_index(corpus_path, index_dir) and then "
@@ -122,19 +79,14 @@ def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
             "manually, do the same."
         )
 
-    # TODO(you): replace this with a real scorer, e.g.:
-    #   return bm25.score(query, k, k1=1.2, b=0.75)
-    return _baseline_retrieve(query, k)
-
-
-# ---------------------------------------------------------------------------
-# Trivial reference baseline — DO NOT submit this as your final entry.
-# Ignores the query and returns the first k documents in the order
-# build_index() persisted them, with a dummy descending score. Enough to
-# exercise the full harness, including real disk persistence across a
-# fresh process; metrics against it will legitimately be close to zero.
-# ---------------------------------------------------------------------------
-def _baseline_retrieve(query: str, k: int) -> List[Tuple[str, float]]:
-    assert _DOC_ORDER is not None
-    top = _DOC_ORDER[:k]
-    return [(doc_id, float(len(top) - i)) for i, doc_id in enumerate(top)]
+    # k1=2.50, b=0.60 -- re-tuned after adding Porter stemming to tokenize()
+    # (indexer.py), which changes the term-frequency/postings distribution
+    # enough that the earlier stemming-free optimum (k1=2.20, b=0.40) no
+    # longer applies. Same two-stage grid search as before: a coarse pass
+    # over k1 in [0.5,0.9,1.2,1.6,2.0] x b in [0,0.25,0.5,0.75,1.0] landed on
+    # k1=2.0,b=0.5 at the k1 grid edge again, so a finer pass over
+    # k1 in [1.8,2.0,2.2,2.5,3.0,3.5] x b in [0.3,0.4,0.5,0.6,0.7] found the
+    # real (non-edge) peak here: nDCG@10=0.6638, with b=0.6 dominating across
+    # nearly every k1 tested and scores declining past k1=3.0 -- a genuine
+    # peak, not another artifact of the search boundary.
+    return bm25.score(query, k, k1=2.50, b=0.60)
