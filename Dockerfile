@@ -20,6 +20,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Build an optional compiled extension in the same location used at grading.
+RUN if [ -f submission/setup.py ]; then \
+        cd submission && python setup.py build_ext --inplace; \
+    fi
+
 # Default command: run the interface conformance + smoke-test suite
 # against the toy set. Course staff override CMD to point at the real
 # corpus/topics/qrels for scoring.

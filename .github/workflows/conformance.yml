@@ -26,6 +26,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Build compiled extension
+        if: ${{ hashFiles('submission/setup.py') != '' }}
+        working-directory: submission
+        run: python setup.py build_ext --inplace
+
       - name: Interface conformance tests
         run: pytest tests/test_interface_conformance.py -v
 
