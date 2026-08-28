@@ -79,7 +79,7 @@ Everything implemented lives in `submission/`:
 | `submission/indexer.py` | Done | Inverted index: postings, document lengths, collection stats, `save()`/`load()` for on-disk persistence. `tokenize()` does lowercase/alphanumeric tokenization, stopword removal, and Porter stemming (`nltk`). |
 | `submission/boolean_vsm.py` | Done | Boolean AND/OR retrieval + TF-IDF cosine vector-space ranking. |
 | `submission/bm25.py` | Done | BM25 with tunable `k1`, `b`. |
-| `submission/custom_scorer.py` | Not implemented | Optional combined/heuristic scorer — not used in this submission; `retrieve()` calls `bm25.score()` directly. |
+| `submission/custom_scorer.py` | Implemented, not wired in | Optional BM25+VSM blend with corpus-adaptive high-df term filtering. Measured on the full dev set but not used in this submission — the filtering hurt nDCG@10 in testing, so `retrieve()` calls `bm25.score()` directly instead. See the report. |
 
 Every file above has a docstring with the relevant formula and a
 reference back to the assignment section it satisfies — read those before
