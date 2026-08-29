@@ -35,7 +35,7 @@ rename them, change their signatures, or move them out of this file.
 """
 from typing import List, Optional, Tuple
 
-from submission import bm25, boolean_vsm
+from submission import bm25, boolean_vsm, custom_scorer
 from submission.corpus_utils import load_corpus
 from submission.indexer import InvertedIndex
 
@@ -66,6 +66,7 @@ def load_index(index_dir: str) -> None:
     _INDEX = InvertedIndex.load(index_dir)
     boolean_vsm.build(_INDEX)
     bm25.build(_INDEX)
+    custom_scorer.build(_INDEX)
 
 
 def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
@@ -79,14 +80,10 @@ def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
             "manually, do the same."
         )
 
-    # k1=2.50, b=0.60 -- re-tuned after adding Porter stemming to tokenize()
-    # (indexer.py), which changes the term-frequency/postings distribution
-    # enough that the earlier stemming-free optimum (k1=2.20, b=0.40) no
-    # longer applies. Same two-stage grid search as before: a coarse pass
-    # over k1 in [0.5,0.9,1.2,1.6,2.0] x b in [0,0.25,0.5,0.75,1.0] landed on
-    # k1=2.0,b=0.5 at the k1 grid edge again, so a finer pass over
-    # k1 in [1.8,2.0,2.2,2.5,3.0,3.5] x b in [0.3,0.4,0.5,0.6,0.7] found the
-    # real (non-edge) peak here: nDCG@10=0.6638, with b=0.6 dominating across
-    # nearly every k1 tested and scores declining past k1=3.0 -- a genuine
-    # peak, not another artifact of the search boundary.
-    return bm25.score(query, k, k1=2.50, b=0.60)
+    # BM25 alone (k1=2.50, b=0.60 -- re-tuned after adding Porter stemming to
+    # tokenize(), see indexer.py) scored nDCG@10=0.6638 on the full dev set.
+    # custom_scorer blends that with VSM cosine (weight swept over the full
+    # dev set: a smooth, broad peak at 0.75 BM25 / 0.25 VSM, every metric
+    # improving together, not just nDCG -- see custom_scorer.py's docstring)
+    # for nDCG@10=0.6735, MAP@10, MRR, and P@10 all improving too.
+    return custom_scorer.score(query, k)
