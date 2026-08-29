@@ -28,7 +28,7 @@ parameters, not hard-coded — you need to sweep them for your report
 (assignment Section 8, "parameter search procedure for k1, b").
 """
 import math
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from submission.indexer import InvertedIndex, tokenize
 
@@ -74,27 +74,30 @@ def score(query: str, k: int, k1: float = 1.2, b: float = 0.75) -> List[Tuple[st
     if not terms:
         return []
 
-    candidate_docs = set()
+    # Term-at-a-time accumulation: visit each query term's postings list
+    # exactly once and add its contribution directly into a running score
+    # dict, instead of first unioning all terms' doc-ids into one
+    # candidate set and then, for every candidate, re-checking every query
+    # term via a dict lookup that mostly misses. That doc-at-a-time
+    # approach does |candidate_docs| * |terms| lookups; a query with one
+    # high-df term (e.g. "covid", 58k+ docs) and a couple of rare terms
+    # wastes most of those on misses. This does exactly
+    # sum(df(term) for term in terms) work -- the minimum possible --
+    # with an identical score formula, just accumulated in a different
+    # order.
+    totals: Dict[str, float] = {}
     for term in terms:
-        candidate_docs.update(_INDEX.postings.get(term, {}).keys())
+        idf = _idf(term)
+        for doc_id, tf in _INDEX.postings.get(term, {}).items():
+            doc_len = _INDEX.doc_len[doc_id]
+            contribution = idf * _saturated_tf(tf, doc_len, k1, b)
+            totals[doc_id] = totals.get(doc_id, 0.0) + contribution
 
-    scores = []
-    for doc_id in candidate_docs:
-        doc_len = _INDEX.doc_len[doc_id]
-        total = 0.0
-        for term in terms:
-            tf = _INDEX.postings.get(term, {}).get(doc_id, 0)
-            if tf == 0:
-                continue
-            total += _idf(term) * _saturated_tf(tf, doc_len, k1, b)
-        scores.append((doc_id, total))
+    scores = list(totals.items())
 
-    # Sort by score desc, doc_id asc as a tie-break. candidate_docs came
-    # from a Python set, whose iteration order is hash-randomized per
-    # process -- without an explicit tie-break key, equal-score documents
-    # would land in an arbitrary order that differs between process runs
-    # (build_index/load_index/retrieve each run in a fresh subprocess),
-    # making otherwise-identical submissions score slightly differently
-    # run to run.
+    # Sort by score desc, doc_id asc as a tie-break. Dict iteration order
+    # (insertion order in modern Python) isn't itself hash-randomized, but
+    # an explicit tie-break still keeps output deterministic regardless of
+    # which order terms/postings were visited in.
     scores.sort(key=lambda pair: (-pair[1], pair[0]))
     return scores[:k]
