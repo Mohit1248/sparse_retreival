@@ -29,7 +29,7 @@ You should see a report ending in something like:
 ```
 nDCG@10:              0.8793
 ...
-Index size on disk:   3.0KB  (3078 bytes)
+Index size on disk:   1.0KB  (1038 bytes)
 ...
 Provisional score (80% weight, nDCG@10 + MAP@10): 0.6980
 (Remaining ±10% efficiency modifier and 0-10% index-size score are
@@ -75,11 +75,11 @@ Everything implemented lives in `submission/`:
 
 | File | Status | What's there |
 |---|---|---|
-| `submission/retrieve.py` | Done | **The required entrypoint** (`build_index`, `load_index`, `retrieve`). Wired to the real inverted index + BM25 (`k1=2.50, b=0.60`, tuned via grid search — see the report). Do not change its function signatures. |
-| `submission/indexer.py` | Done | Inverted index: postings, document lengths, collection stats, `save()`/`load()` for on-disk persistence. `tokenize()` does lowercase/alphanumeric tokenization, stopword removal, and Porter stemming (`nltk`). |
+| `submission/retrieve.py` | Done | **The required entrypoint** (`build_index`, `load_index`, `retrieve`). Wired to `custom_scorer.score()` — a tuned BM25+VSM blend (`k1=2.50, b=0.60`, blend weight 0.75/0.25, both grid-searched — see the report). Do not change its function signatures. |
+| `submission/indexer.py` | Done | Inverted index: postings, document lengths, collection stats. `tokenize()` does lowercase/alphanumeric tokenization, stopword removal, and Porter stemming (`nltk`). `save()`/`load()` use a compact on-disk encoding (integerized doc-ids, delta-encoded + `array`-packed postings, zlib) — ~87% smaller than a naive JSON dump, same in-memory index either way. |
 | `submission/boolean_vsm.py` | Done | Boolean AND/OR retrieval + TF-IDF cosine vector-space ranking. |
-| `submission/bm25.py` | Done | BM25 with tunable `k1`, `b`. |
-| `submission/custom_scorer.py` | Implemented, not wired in | Optional BM25+VSM blend with corpus-adaptive high-df term filtering. Measured on the full dev set but not used in this submission — the filtering hurt nDCG@10 in testing, so `retrieve()` calls `bm25.score()` directly instead. See the report. |
+| `submission/bm25.py` | Done | BM25 with tunable `k1`, `b`, term-at-a-time scoring for query-latency. |
+| `submission/custom_scorer.py` | Done, wired in | BM25+VSM blend (weight grid-searched on the full dev set — nDCG@10 0.6638 → 0.6735, every metric improving together). This is what `retrieve()` actually calls. See the report. |
 
 Every file above has a docstring with the relevant formula and a
 reference back to the assignment section it satisfies — read those before
