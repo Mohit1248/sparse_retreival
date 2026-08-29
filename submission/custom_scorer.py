@@ -31,6 +31,19 @@ every metric (nDCG@10, MAP@10, MRR, P@10) improves together at that
 point versus pure BM25 -- evidence this reflects a real signal rather
 than fitting noise in these 50 dev queries.
 
+Title signal: a third component scores overlap with each document's
+title zone (indexer.py's title_postings -- see TITLE_ZONE_WORDS'
+docstring there for why that's a leading-word-count heuristic and not a
+separate corpus field or punctuation split). Grid-searched jointly with
+the title zone's word count against the full dev set: a broad plateau
+across word-count 7-9 and title weight 0.15-0.25 (not a single sharp
+spike -- e.g. K=8/w=0.20 -> 0.6907, K=9/w=0.15 -> 0.6959, K=9/w=0.20 ->
+0.6958, all close together), landing on K=9 words / weight 0.20 as a
+point solidly inside that plateau rather than the single best-observed
+value (which risks being fine-grained noise on only 50 dev queries).
+That takes nDCG@10 from 0.6735 (BM25+VSM alone) to 0.6958 -- a further
+real gain on top of the blend weight tuning above.
+
 If you use this, wire it in from submission/retrieve.py's retrieve()
 instead of calling a single scorer directly, and describe what you did
 and why in your report (Section 7, "one-paragraph description of your
@@ -44,11 +57,12 @@ from submission.indexer import InvertedIndex, tokenize
 
 _INDEX: Optional[InvertedIndex] = None
 
-# BM25/VSM blend weight and BM25's k1/b -- kept as defaults here (not
-# re-exposed as score() parameters) so retrieve.py's call stays simple;
-# see the report for the grid search behind these values.
-_BM25_WEIGHT = 0.75
-_VSM_WEIGHT = 0.25
+# BM25/VSM/title blend weights and BM25's k1/b -- kept as defaults here
+# (not re-exposed as score() parameters) so retrieve.py's call stays
+# simple; see the report for the grid search behind these values.
+_TITLE_WEIGHT = 0.20
+_BM25_WEIGHT = (1 - _TITLE_WEIGHT) * 0.75
+_VSM_WEIGHT = (1 - _TITLE_WEIGHT) * 0.25
 _K1 = 2.50
 _B = 0.60
 
@@ -112,12 +126,26 @@ def score(query: str, k: int) -> List[Tuple[str, float]]:
         if d_norm > 0:
             vsm_scores[doc_id] = dot / (q_norm * d_norm)
 
+    # Title signal: simple term-overlap count against each document's
+    # title zone (indexer.py's title_postings), term-at-a-time like the
+    # signals above.
+    title_totals: Dict[str, float] = {}
+    for term in terms:
+        for doc_id, tf in _INDEX.title_postings.get(term, {}).items():
+            title_totals[doc_id] = title_totals.get(doc_id, 0.0) + tf
+
     bm25_n = _normalize(bm25_totals)
     vsm_n = _normalize(vsm_scores)
+    title_n = _normalize(title_totals)
 
-    candidate_docs = set(bm25_totals) | set(vsm_scores)
+    candidate_docs = set(bm25_totals) | set(vsm_scores) | set(title_totals)
     combined = [
-        (doc_id, _BM25_WEIGHT * bm25_n.get(doc_id, 0.0) + _VSM_WEIGHT * vsm_n.get(doc_id, 0.0))
+        (
+            doc_id,
+            _BM25_WEIGHT * bm25_n.get(doc_id, 0.0)
+            + _VSM_WEIGHT * vsm_n.get(doc_id, 0.0)
+            + _TITLE_WEIGHT * title_n.get(doc_id, 0.0),
+        )
         for doc_id in candidate_docs
     ]
     combined.sort(key=lambda pair: (-pair[1], pair[0]))

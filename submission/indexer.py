@@ -101,6 +101,66 @@ def tokenize(text: str) -> List[str]:
     return [_stem(tok) for tok in _TOKEN_RE.findall(text.lower()) if tok not in _STOPWORDS]
 
 
+# Number of leading whitespace-split words of each document's raw text
+# treated as an approximate "title" zone (submission/custom_scorer.py
+# weights matches here higher). Deliberately a fixed word count, not a
+# punctuation/sentence-boundary heuristic or a separate corpus field:
+# inspecting data/full/corpus.jsonl directly showed titles are merged
+# into `text` with no reliable delimiter (some end mid-sentence with no
+# punctuation at all before the abstract begins), and the documented
+# schema (data/README.md) guarantees only {"doc_id", "text"} -- the same
+# format the held-out corpus is promised to use -- so a separate title
+# field can't be assumed to exist there. A leading word count needs
+# neither. Value chosen via a grid search over word-count x blend-weight
+# against the full dev set (see custom_scorer.py's docstring).
+TITLE_ZONE_WORDS = 9
+
+
+def _encode_postings(
+    postings: Dict[str, Dict[str, int]], doc_id_to_idx: Dict[str, int]
+) -> Tuple[List[str], List[int], bytes, bytes]:
+    """Shared by save() for both self.postings and self.title_postings --
+    see save()'s docstring for the encoding scheme. Returns
+    (terms, per-term posting counts, gaps bytes, tfs bytes)."""
+    terms = sorted(postings.keys())
+    gaps: List[int] = []
+    tfs: List[int] = []
+    term_counts: List[int] = []
+    for term in terms:
+        sorted_entries = sorted(
+            (doc_id_to_idx[doc_id], tf) for doc_id, tf in postings[term].items()
+        )
+        term_counts.append(len(sorted_entries))
+        prev_idx = 0
+        for doc_idx, tf in sorted_entries:
+            gaps.append(doc_idx - prev_idx)
+            tfs.append(tf)
+            prev_idx = doc_idx
+    return terms, term_counts, array.array("I", gaps).tobytes(), array.array("I", tfs).tobytes()
+
+
+def _decode_postings(
+    terms: List[str], term_counts: List[int], gaps_bytes: bytes, tfs_bytes: bytes, doc_ids: List[str]
+) -> Dict[str, Dict[str, int]]:
+    """Inverse of _encode_postings."""
+    gaps = array.array("I")
+    gaps.frombytes(gaps_bytes)
+    tfs = array.array("I")
+    tfs.frombytes(tfs_bytes)
+
+    postings: Dict[str, Dict[str, int]] = {}
+    pos = 0
+    for term, count in zip(terms, term_counts):
+        term_postings: Dict[str, int] = {}
+        doc_idx = 0
+        for i in range(pos, pos + count):
+            doc_idx += gaps[i]
+            term_postings[doc_ids[doc_idx]] = tfs[i]
+        postings[term] = term_postings
+        pos += count
+    return postings
+
+
 class InvertedIndex:
     """A minimal inverted index skeleton. Extend the data structures here
     however your design needs (e.g. term positions for phrase/proximity
@@ -110,6 +170,12 @@ class InvertedIndex:
 
     def __init__(self):
         self.postings: Dict[str, Dict[str, int]] = {}  # term -> {doc_id: term_freq}
+        # term -> {doc_id: term_freq}, restricted to each document's first
+        # TITLE_ZONE_WORDS words -- see TITLE_ZONE_WORDS' docstring above
+        # for why this (not a separate corpus field) is the title-zone
+        # source. Read by submission/custom_scorer.py for title-weighted
+        # scoring; bm25.py/boolean_vsm.py ignore it entirely.
+        self.title_postings: Dict[str, Dict[str, int]] = {}
         self.doc_len: Dict[str, int] = {}  # doc_id -> number of tokens
         self.N: int = 0  # number of documents
         self.avg_doc_len: float = 0.0
@@ -118,11 +184,11 @@ class InvertedIndex:
         """corpus: list of (doc_id, text) pairs, e.g. from
         submission.corpus_utils.load_corpus().
 
-        Tokenizes each document, populates self.postings, self.doc_len,
-        self.N, and self.avg_doc_len. Raw document text is not retained —
-        BM25/VSM only need term-frequency and length statistics, and
-        keeping it around would inflate the graded on-disk index size for
-        no query-time benefit.
+        Tokenizes each document, populates self.postings, self.title_postings,
+        self.doc_len, self.N, and self.avg_doc_len. Raw document text is not
+        retained — BM25/VSM only need term-frequency and length statistics,
+        and keeping it around would inflate the graded on-disk index size
+        for no query-time benefit.
         """
         total_len = 0
 
@@ -140,6 +206,16 @@ class InvertedIndex:
                 if term not in self.postings:
                     self.postings[term] = {}
                 self.postings[term][doc_id] = count
+
+            title_zone_text = " ".join(text.split()[:TITLE_ZONE_WORDS])
+            title_term_counts: Dict[str, int] = {}
+            for tok in tokenize(title_zone_text):
+                title_term_counts[tok] = title_term_counts.get(tok, 0) + 1
+
+            for term, count in title_term_counts.items():
+                if term not in self.title_postings:
+                    self.title_postings[term] = {}
+                self.title_postings[term][doc_id] = count
 
         self.N = len(corpus)
         self.avg_doc_len = total_len / self.N if self.N > 0 else 0.0
@@ -186,23 +262,10 @@ class InvertedIndex:
         doc_id_to_idx = {doc_id: i for i, doc_id in enumerate(doc_ids)}
         doc_len_arr = [self.doc_len[doc_id] for doc_id in doc_ids]
 
-        terms = sorted(self.postings.keys())
-        gaps: List[int] = []
-        tfs: List[int] = []
-        term_counts: List[int] = []
-
-        for term in terms:
-            postings = self.postings[term]
-            # Sort by doc index ascending so gaps are non-negative.
-            sorted_entries = sorted(
-                (doc_id_to_idx[doc_id], tf) for doc_id, tf in postings.items()
-            )
-            term_counts.append(len(sorted_entries))
-            prev_idx = 0
-            for doc_idx, tf in sorted_entries:
-                gaps.append(doc_idx - prev_idx)
-                tfs.append(tf)
-                prev_idx = doc_idx
+        terms, term_counts, gaps_bytes, tfs_bytes = _encode_postings(self.postings, doc_id_to_idx)
+        title_terms, title_term_counts, title_gaps_bytes, title_tfs_bytes = _encode_postings(
+            self.title_postings, doc_id_to_idx
+        )
 
         payload = {
             "doc_ids": doc_ids,
@@ -211,8 +274,12 @@ class InvertedIndex:
             "avg_doc_len": self.avg_doc_len,
             "terms": terms,
             "term_counts": term_counts,
-            "gaps_bytes": array.array("I", gaps).tobytes(),
-            "tfs_bytes": array.array("I", tfs).tobytes(),
+            "gaps_bytes": gaps_bytes,
+            "tfs_bytes": tfs_bytes,
+            "title_terms": title_terms,
+            "title_term_counts": title_term_counts,
+            "title_gaps_bytes": title_gaps_bytes,
+            "title_tfs_bytes": title_tfs_bytes,
         }
         blob = zlib.compress(pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL), level=3)
 
@@ -236,27 +303,20 @@ class InvertedIndex:
 
         doc_ids: List[str] = payload["doc_ids"]
         doc_len_arr: List[int] = payload["doc_len"]
-        terms: List[str] = payload["terms"]
-        term_counts: List[int] = payload["term_counts"]
-
-        gaps = array.array("I")
-        gaps.frombytes(payload["gaps_bytes"])
-        tfs = array.array("I")
-        tfs.frombytes(payload["tfs_bytes"])
 
         idx = cls()
         idx.doc_len = {doc_id: length for doc_id, length in zip(doc_ids, doc_len_arr)}
         idx.N = payload["N"]
         idx.avg_doc_len = payload["avg_doc_len"]
-
-        pos = 0
-        for term, count in zip(terms, term_counts):
-            term_postings: Dict[str, int] = {}
-            doc_idx = 0
-            for i in range(pos, pos + count):
-                doc_idx += gaps[i]
-                term_postings[doc_ids[doc_idx]] = tfs[i]
-            idx.postings[term] = term_postings
-            pos += count
+        idx.postings = _decode_postings(
+            payload["terms"], payload["term_counts"], payload["gaps_bytes"], payload["tfs_bytes"], doc_ids
+        )
+        idx.title_postings = _decode_postings(
+            payload["title_terms"],
+            payload["title_term_counts"],
+            payload["title_gaps_bytes"],
+            payload["title_tfs_bytes"],
+            doc_ids,
+        )
 
         return idx
