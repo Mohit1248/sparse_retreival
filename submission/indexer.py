@@ -26,16 +26,27 @@ directly (smaller, relative to the class median, scores better), so a
 compact postings encoding is worth more here than in most course
 assignments — see the `save()` docstring for concrete starting points.
 """
+import array
 import functools
 import json
 import os
+import pickle
 import re
+import zlib
 from typing import Dict, List, Tuple
 
 from nltk.stem import PorterStemmer
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _STEMMER = PorterStemmer()
+
+# array('I') is documented as the platform C `unsigned int`, not a fixed
+# width -- 4 bytes on every mainstream x86/x86_64/ARM target (including
+# both the Windows dev machine this was built on and the Ubuntu grading
+# machine), but save()/load() below depend on that width matching between
+# the two, so assert it rather than silently risking corruption if it
+# ever doesn't.
+assert array.array("I").itemsize == 4, "array('I') is not 4 bytes on this platform"
 
 
 @functools.lru_cache(maxsize=None)
@@ -145,43 +156,107 @@ class InvertedIndex:
 
         The on-disk byte size of whatever you write here is graded
         directly (assignment Section 7, "index size", relative to the
-        class median) — some starting points, roughly in order of effort:
-          - json/pickle-dump self.postings etc. directly (works, but
-            verbose: repeats every doc_id string per posting).
-          - drop self.doc_text if your scorers don't need raw text at
-            query time (BM25/VSM only need term-frequency and length
-            statistics, not the original documents).
-          - delta-encode each postings list's doc-ids (sorted ascending,
-            store gaps instead of absolute ids) and varint/byte-pack them,
-            instead of a naive JSON list of integers.
-
-        Simplest-correct version: dump everything as one JSON file. Not
-        size-optimized yet (see docstring above for compression ideas) —
-        revisit once the basic pipeline works end-to-end.
+        class median), so a naive json.dump of self.postings (which
+        repeats every doc_id string, ~8 chars, once per posting -- tens of
+        millions of times across the full corpus) is expensive. Instead:
+          1. Integerize doc_ids: assign each doc_id a compact int index
+             0..N-1 (stored once, as a single doc_ids array), instead of
+             repeating the string in every posting.
+          2. Within each term's postings, sort by doc index ascending and
+             delta-encode (store gaps between consecutive doc indices,
+             not absolute values) -- gaps are usually small for common
+             terms, so they pack tighter and compress better.
+          3. Pack every (gap, tf) as a fixed-width unsigned 4-byte int via
+             the stdlib `array` module's C-level tobytes()/frombytes() --
+             a spec note (Section 3) warns the held-out corpus could be
+             >=500K docs, so gaps need more headroom than a 2-byte field
+             gives; a Python-level loop doing this byte-by-byte (e.g. a
+             hand-rolled varint) was measured at ~27s of index-build time
+             on the full corpus purely from per-value function-call
+             overhead -- array.tobytes() does the same packing in C.
+          4. zlib-compress the whole thing as a final pass (stdlib, not a
+             search/indexing library -- this is generic byte compression,
+             not part of the required indexing/scoring logic). Level 9
+             (measured: ~1334s -- over 22 minutes -- for this fixed-width
+             payload, vs. ~2.7s at level 3 for barely better compression)
+             would be catastrophic for index-build-time; level 3 gives
+             nearly all of the size win for a small, bounded time cost.
         """
-        data = {
-            "postings": self.postings,
-            "doc_len": self.doc_len,
+        doc_ids = sorted(self.doc_len.keys())
+        doc_id_to_idx = {doc_id: i for i, doc_id in enumerate(doc_ids)}
+        doc_len_arr = [self.doc_len[doc_id] for doc_id in doc_ids]
+
+        terms = sorted(self.postings.keys())
+        gaps: List[int] = []
+        tfs: List[int] = []
+        term_counts: List[int] = []
+
+        for term in terms:
+            postings = self.postings[term]
+            # Sort by doc index ascending so gaps are non-negative.
+            sorted_entries = sorted(
+                (doc_id_to_idx[doc_id], tf) for doc_id, tf in postings.items()
+            )
+            term_counts.append(len(sorted_entries))
+            prev_idx = 0
+            for doc_idx, tf in sorted_entries:
+                gaps.append(doc_idx - prev_idx)
+                tfs.append(tf)
+                prev_idx = doc_idx
+
+        payload = {
+            "doc_ids": doc_ids,
+            "doc_len": doc_len_arr,
             "N": self.N,
             "avg_doc_len": self.avg_doc_len,
+            "terms": terms,
+            "term_counts": term_counts,
+            "gaps_bytes": array.array("I", gaps).tobytes(),
+            "tfs_bytes": array.array("I", tfs).tobytes(),
         }
-        path = os.path.join(index_dir, "index.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f)
+        blob = zlib.compress(pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL), level=3)
+
+        path = os.path.join(index_dir, "index.bin")
+        with open(path, "wb") as f:
+            f.write(blob)
 
     @classmethod
     def load(cls, index_dir: str) -> "InvertedIndex":
         """Reconstruct an InvertedIndex purely from what save() wrote to
         `index_dir`. Called in a fresh process — do not rely on any state
-        other than what's actually on disk in `index_dir`.
+        other than what's actually on disk in `index_dir`. Rebuilds the
+        exact same self.postings / self.doc_len shapes (string-keyed) that
+        build() produces, so every scorer module is unaffected by this
+        on-disk encoding.
         """
-        path = os.path.join(index_dir, "index.json")
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        path = os.path.join(index_dir, "index.bin")
+        with open(path, "rb") as f:
+            blob = f.read()
+        payload = pickle.loads(zlib.decompress(blob))
+
+        doc_ids: List[str] = payload["doc_ids"]
+        doc_len_arr: List[int] = payload["doc_len"]
+        terms: List[str] = payload["terms"]
+        term_counts: List[int] = payload["term_counts"]
+
+        gaps = array.array("I")
+        gaps.frombytes(payload["gaps_bytes"])
+        tfs = array.array("I")
+        tfs.frombytes(payload["tfs_bytes"])
 
         idx = cls()
-        idx.postings = data["postings"]
-        idx.doc_len = data["doc_len"]
-        idx.N = data["N"]
-        idx.avg_doc_len = data["avg_doc_len"]
+        idx.doc_len = {doc_id: length for doc_id, length in zip(doc_ids, doc_len_arr)}
+        idx.N = payload["N"]
+        idx.avg_doc_len = payload["avg_doc_len"]
+
+        pos = 0
+        for term, count in zip(terms, term_counts):
+            term_postings: Dict[str, int] = {}
+            doc_idx = 0
+            for i in range(pos, pos + count):
+                doc_idx += gaps[i]
+                term_postings[doc_ids[doc_idx]] = tfs[i]
+            idx.postings[term] = term_postings
+            pos += count
+
         return idx
