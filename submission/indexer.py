@@ -121,18 +121,30 @@ def _encode_postings(
 ) -> Tuple[List[str], List[int], bytes, bytes]:
     """Shared by save() for both self.postings and self.title_postings --
     see save()'s docstring for the encoding scheme. Returns
-    (terms, per-term posting counts, gaps bytes, tfs bytes)."""
+    (terms, per-term posting counts, gaps bytes, tfs bytes).
+
+    No per-term sort: doc_id_to_idx assigns indices in corpus encounter
+    order (see save()), and build() inserts a doc_id into postings[term]
+    exactly once -- the first time that term appears in that document --
+    walking the corpus in a single forward pass. Since Python dicts
+    preserve insertion order, postings[term] is therefore already in
+    increasing doc-index order by construction; a linear scan is enough.
+    Sorting ~13M+ (doc_idx, tf) pairs across all terms used to be the
+    single largest chunk of index-build time. If this invariant is ever
+    violated (e.g. build() starts inserting out of corpus order), the
+    unsigned array.array("I") construction below fails loudly on the
+    resulting negative gap rather than silently corrupting the index.
+    """
     terms = sorted(postings.keys())
     gaps: List[int] = []
     tfs: List[int] = []
     term_counts: List[int] = []
     for term in terms:
-        sorted_entries = sorted(
-            (doc_id_to_idx[doc_id], tf) for doc_id, tf in postings[term].items()
-        )
-        term_counts.append(len(sorted_entries))
+        term_postings = postings[term]
+        term_counts.append(len(term_postings))
         prev_idx = 0
-        for doc_idx, tf in sorted_entries:
+        for doc_id, tf in term_postings.items():
+            doc_idx = doc_id_to_idx[doc_id]
             gaps.append(doc_idx - prev_idx)
             tfs.append(tf)
             prev_idx = doc_idx
@@ -207,7 +219,11 @@ class InvertedIndex:
                     self.postings[term] = {}
                 self.postings[term][doc_id] = count
 
-            title_zone_text = " ".join(text.split()[:TITLE_ZONE_WORDS])
+            # maxsplit stops after TITLE_ZONE_WORDS splits instead of
+            # splitting the whole (possibly long) document just to slice
+            # off the first few words -- identical result, cheaper for
+            # anything longer than the title zone itself.
+            title_zone_text = " ".join(text.split(maxsplit=TITLE_ZONE_WORDS)[:TITLE_ZONE_WORDS])
             title_term_counts: Dict[str, int] = {}
             for tok in tokenize(title_zone_text):
                 title_term_counts[tok] = title_term_counts.get(tok, 0) + 1
@@ -258,7 +274,13 @@ class InvertedIndex:
              would be catastrophic for index-build-time; level 3 gives
              nearly all of the size win for a small, bounded time cost.
         """
-        doc_ids = sorted(self.doc_len.keys())
+        # Corpus encounter order, not alphabetical -- _encode_postings()
+        # relies on this matching the order build() inserted doc_ids into
+        # postings[term], so postings entries come out pre-sorted by doc
+        # index with no separate sort pass needed. Nothing else depends on
+        # doc_ids being alphabetically sorted (scorers tie-break on the
+        # doc_id string itself, not array position).
+        doc_ids = list(self.doc_len.keys())
         doc_id_to_idx = {doc_id: i for i, doc_id in enumerate(doc_ids)}
         doc_len_arr = [self.doc_len[doc_id] for doc_id in doc_ids]
 
