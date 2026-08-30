@@ -49,7 +49,9 @@ instead of calling a single scorer directly, and describe what you did
 and why in your report (Section 7, "one-paragraph description of your
 final competition entry").
 """
+import heapq
 import math
+from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
 from submission import bm25, boolean_vsm
@@ -77,48 +79,66 @@ def build(index: InvertedIndex) -> None:
     _INDEX = index
 
 
-def _normalize(scores: Dict[str, float]) -> Dict[str, float]:
-    """Min-max scale to [0, 1] so BM25's unbounded scale and VSM's
-    already-[0,1] cosine scale contribute comparably to the blend."""
+def _minmax(scores: Dict[str, float]) -> Tuple[float, float]:
     if not scores:
-        return {}
+        return 0.0, 0.0
     values = scores.values()
-    lo, hi = min(values), max(values)
+    return min(values), max(values)
+
+
+def _norm(value: Optional[float], lo: float, hi: float) -> float:
+    """Min-max scale to [0, 1] so BM25's unbounded scale and VSM's
+    already-[0,1] cosine scale contribute comparably to the blend.
+    Missing (None) -> 0.0, matching the old dict.get(doc_id, 0.0) default;
+    a flat signal (hi == lo) -> 1.0 for every doc that has it, same as
+    the old _normalize()'s special case."""
+    if value is None:
+        return 0.0
     if hi == lo:
-        return {doc_id: 1.0 for doc_id in scores}
-    return {doc_id: (v - lo) / (hi - lo) for doc_id, v in scores.items()}
+        return 1.0
+    return (value - lo) / (hi - lo)
 
 
 def score(query: str, k: int) -> List[Tuple[str, float]]:
     """Return up to k (doc_id, score) pairs for `query`, ranked by a
-    normalised BM25+VSM blend, highest score first."""
+    normalised BM25+VSM+title blend, highest score first."""
     terms = tokenize(query)
     if not terms:
         return []
 
-    # Term-at-a-time for both signals: visit each query term's postings
-    # list exactly once and accumulate directly into a score dict, rather
-    # than unioning all terms' doc-ids into one candidate set and then, for
-    # every candidate, re-checking every query term via a mostly-missing
-    # dict lookup. See bm25.py's score() for the full rationale -- same
-    # O(sum of df(term)) vs O(|candidates| * |terms|) argument applies to
-    # both signals computed here.
-    bm25_totals: Dict[str, float] = {}
-    for term in terms:
-        idf = bm25._idf(term)
-        for doc_id, tf in _INDEX.postings.get(term, {}).items():
-            doc_len = _INDEX.doc_len[doc_id]
-            contribution = idf * bm25._saturated_tf(tf, doc_len, _K1, _B)
-            bm25_totals[doc_id] = bm25_totals.get(doc_id, 0.0) + contribution
+    # Term-at-a-time, one postings walk per unique query term: BM25 and
+    # VSM both read the same _INDEX.postings[term], so they're accumulated
+    # together in a single pass instead of two (this used to be two full
+    # walks over what can be a near-corpus-size postings list for a
+    # high-df term -- COVID-corpus queries hit these constantly). `count`
+    # replicates what looping over `terms` with repeats used to do: a
+    # repeated query term got its postings walked once per occurrence, so
+    # here each unique term's contribution is scaled by how many times it
+    # occurred instead.
+    term_counts = Counter(terms)
 
     q_vec = boolean_vsm._query_vector(terms)
     q_norm = math.sqrt(sum(w * w for w in q_vec.values())) if q_vec else 0.0
+
+    bm25_totals: Dict[str, float] = {}
     vsm_dot: Dict[str, float] = {}
-    if q_norm > 0:
-        for term, q_weight in q_vec.items():
-            idf = boolean_vsm._idf(term)
-            for doc_id, tf in _INDEX.postings.get(term, {}).items():
-                vsm_dot[doc_id] = vsm_dot.get(doc_id, 0.0) + q_weight * (tf * idf)
+    for term, count in term_counts.items():
+        postings = _INDEX.postings.get(term)
+        if not postings:
+            continue
+        idf_bm25 = bm25._idf(term)
+        # Only worth computing VSM's side if this term actually carries
+        # query weight (it always will unless q_norm == 0, i.e. every
+        # query term has idf 0) -- avoids a second idf lookup otherwise.
+        q_weight = q_vec.get(term, 0.0) if q_norm > 0 else 0.0
+        idf_vsm = boolean_vsm._idf(term) if q_weight else 0.0
+        for doc_id, tf in postings.items():
+            doc_len = _INDEX.doc_len[doc_id]
+            bm25_totals[doc_id] = (
+                bm25_totals.get(doc_id, 0.0) + count * idf_bm25 * bm25._saturated_tf(tf, doc_len, _K1, _B)
+            )
+            if q_weight:
+                vsm_dot[doc_id] = vsm_dot.get(doc_id, 0.0) + q_weight * (tf * idf_vsm)
 
     vsm_scores: Dict[str, float] = {}
     for doc_id, dot in vsm_dot.items():
@@ -127,26 +147,39 @@ def score(query: str, k: int) -> List[Tuple[str, float]]:
             vsm_scores[doc_id] = dot / (q_norm * d_norm)
 
     # Title signal: simple term-overlap count against each document's
-    # title zone (indexer.py's title_postings), term-at-a-time like the
-    # signals above.
+    # title zone (indexer.py's title_postings) -- these postings lists are
+    # bounded by TITLE_ZONE_WORDS, so much cheaper than the main index.
     title_totals: Dict[str, float] = {}
-    for term in terms:
-        for doc_id, tf in _INDEX.title_postings.get(term, {}).items():
-            title_totals[doc_id] = title_totals.get(doc_id, 0.0) + tf
+    for term, count in term_counts.items():
+        tpost = _INDEX.title_postings.get(term)
+        if not tpost:
+            continue
+        for doc_id, tf in tpost.items():
+            title_totals[doc_id] = title_totals.get(doc_id, 0.0) + count * tf
 
-    bm25_n = _normalize(bm25_totals)
-    vsm_n = _normalize(vsm_scores)
-    title_n = _normalize(title_totals)
+    bm25_lo, bm25_hi = _minmax(bm25_totals)
+    vsm_lo, vsm_hi = _minmax(vsm_scores)
+    title_lo, title_hi = _minmax(title_totals)
 
-    candidate_docs = set(bm25_totals) | set(vsm_scores) | set(title_totals)
-    combined = [
+    # Normalize inline instead of materializing three full-candidate-size
+    # dicts up front, and select the top k with a partial heap instead of
+    # sorting the whole (possibly near-corpus-size) candidate set -- same
+    # (-score, doc_id) tie-break as a full sort would give, just O(n log k)
+    # instead of O(n log n).
+    #
+    # candidate_docs is just bm25_totals's keys, not a 3-way set union:
+    # vsm_dot and title_totals are only ever populated for doc_ids that
+    # bm25_totals already has an entry for (same _INDEX.postings[term]
+    # walk for VSM; the title zone is always a prefix of the same doc's
+    # full text, tokenized the same way, so any term in title_postings[t]
+    # is necessarily also in postings[t]) -- so both are always subsets.
+    combined = (
         (
             doc_id,
-            _BM25_WEIGHT * bm25_n.get(doc_id, 0.0)
-            + _VSM_WEIGHT * vsm_n.get(doc_id, 0.0)
-            + _TITLE_WEIGHT * title_n.get(doc_id, 0.0),
+            _BM25_WEIGHT * _norm(raw_bm25, bm25_lo, bm25_hi)
+            + _VSM_WEIGHT * _norm(vsm_scores.get(doc_id), vsm_lo, vsm_hi)
+            + _TITLE_WEIGHT * _norm(title_totals.get(doc_id), title_lo, title_hi),
         )
-        for doc_id in candidate_docs
-    ]
-    combined.sort(key=lambda pair: (-pair[1], pair[0]))
-    return combined[:k]
+        for doc_id, raw_bm25 in bm25_totals.items()
+    )
+    return heapq.nsmallest(k, combined, key=lambda pair: (-pair[1], pair[0]))
