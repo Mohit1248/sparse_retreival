@@ -33,6 +33,7 @@ import os
 import pickle
 import re
 import zlib
+from collections import Counter
 from typing import Dict, List, Tuple
 
 from nltk.stem import PorterStemmer
@@ -203,6 +204,8 @@ class InvertedIndex:
         for no query-time benefit.
         """
         total_len = 0
+        postings = self.postings
+        title_postings = self.title_postings
 
         for doc_id, text in corpus:
             tokens = tokenize(text)
@@ -210,28 +213,26 @@ class InvertedIndex:
             self.doc_len[doc_id] = len(tokens)
             total_len += len(tokens)
 
-            term_counts: Dict[str, int] = {}
-            for tok in tokens:
-                term_counts[tok] = term_counts.get(tok, 0) + 1
-
-            for term, count in term_counts.items():
-                if term not in self.postings:
-                    self.postings[term] = {}
-                self.postings[term][doc_id] = count
+            # Counter(tokens) is a C-accelerated bulk count (CPython's
+            # Counter.update has a fast path for exactly this) -- same
+            # multiset of counts as the old manual get()/increment loop,
+            # just without a Python-level dict.get() call per token
+            # occurrence (tens of millions across the full corpus).
+            for term, count in Counter(tokens).items():
+                # setdefault does the "look up this term's bucket, create
+                # it if missing" step as one dict operation instead of the
+                # old `if term not in postings: postings[term] = {}` (a
+                # separate membership check plus, on a new term, a second
+                # insert) followed by a third lookup to fetch it back.
+                postings.setdefault(term, {})[doc_id] = count
 
             # maxsplit stops after TITLE_ZONE_WORDS splits instead of
             # splitting the whole (possibly long) document just to slice
             # off the first few words -- identical result, cheaper for
             # anything longer than the title zone itself.
             title_zone_text = " ".join(text.split(maxsplit=TITLE_ZONE_WORDS)[:TITLE_ZONE_WORDS])
-            title_term_counts: Dict[str, int] = {}
-            for tok in tokenize(title_zone_text):
-                title_term_counts[tok] = title_term_counts.get(tok, 0) + 1
-
-            for term, count in title_term_counts.items():
-                if term not in self.title_postings:
-                    self.title_postings[term] = {}
-                self.title_postings[term][doc_id] = count
+            for term, count in Counter(tokenize(title_zone_text)).items():
+                title_postings.setdefault(term, {})[doc_id] = count
 
         self.N = len(corpus)
         self.avg_doc_len = total_len / self.N if self.N > 0 else 0.0

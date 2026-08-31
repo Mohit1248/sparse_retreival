@@ -51,7 +51,7 @@ final competition entry").
 """
 import heapq
 import math
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Tuple
 
 from submission import bm25, boolean_vsm
@@ -120,10 +120,25 @@ def score(query: str, k: int) -> List[Tuple[str, float]]:
     q_vec = boolean_vsm._query_vector(terms)
     q_norm = math.sqrt(sum(w * w for w in q_vec.values())) if q_vec else 0.0
 
-    bm25_totals: Dict[str, float] = {}
-    vsm_dot: Dict[str, float] = {}
+    # Local bindings for everything read once per posting (millions of
+    # times on high-df terms): CPython resolves a local (LOAD_FAST) far
+    # cheaper than a module-global or an attribute chain (LOAD_GLOBAL /
+    # LOAD_ATTR) re-walked on every one of those iterations.
+    postings_get = _INDEX.postings.get
+    title_postings_get = _INDEX.title_postings.get
+    doc_len_map = _INDEX.doc_len
+    avg_doc_len = _INDEX.avg_doc_len
+    k1, b = _K1, _B
+    k1_plus_1 = k1 + 1  # same fixed float bm25._saturated_tf recomputed on every call
+
+    # defaultdict(float): same accumulation arithmetic as the old
+    # `d.get(doc_id, 0.0) + v` / `d[doc_id] = ...` pair, just without a
+    # bound-method .get() call on every posting -- identical floats out,
+    # fewer bytecodes to get there.
+    bm25_totals: Dict[str, float] = defaultdict(float)
+    vsm_dot: Dict[str, float] = defaultdict(float)
     for term, count in term_counts.items():
-        postings = _INDEX.postings.get(term)
+        postings = postings_get(term)
         if not postings:
             continue
         idf_bm25 = bm25._idf(term)
@@ -132,30 +147,41 @@ def score(query: str, k: int) -> List[Tuple[str, float]]:
         # query term has idf 0) -- avoids a second idf lookup otherwise.
         q_weight = q_vec.get(term, 0.0) if q_norm > 0 else 0.0
         idf_vsm = boolean_vsm._idf(term) if q_weight else 0.0
+        # count * idf_bm25 doesn't depend on doc_id -- the old code
+        # recomputed this identical product on every posting in this
+        # term's list (up to ~60k times for a high-df COVID term) even
+        # though Python never hoists loop-invariant subexpressions for
+        # you. Same two floats multiplied once instead of N times is
+        # bit-identical, just without the redundant work.
+        bm25_coeff = count * idf_bm25
         for doc_id, tf in postings.items():
-            doc_len = _INDEX.doc_len[doc_id]
-            bm25_totals[doc_id] = (
-                bm25_totals.get(doc_id, 0.0) + count * idf_bm25 * bm25._saturated_tf(tf, doc_len, _K1, _B)
-            )
+            # Inlined bm25._saturated_tf: identical formula, same
+            # operation order, just without a Python function-call per
+            # posting (this loop body runs millions of times per query
+            # on the high-df terms this corpus is full of).
+            length_adjustment = 1 - b + b * (doc_len_map[doc_id] / avg_doc_len)
+            saturated = (tf * k1_plus_1) / (tf + k1 * length_adjustment)
+            bm25_totals[doc_id] += bm25_coeff * saturated
             if q_weight:
-                vsm_dot[doc_id] = vsm_dot.get(doc_id, 0.0) + q_weight * (tf * idf_vsm)
+                vsm_dot[doc_id] += q_weight * (tf * idf_vsm)
 
     vsm_scores: Dict[str, float] = {}
+    doc_norms_get = boolean_vsm._DOC_NORMS.get
     for doc_id, dot in vsm_dot.items():
-        d_norm = boolean_vsm._DOC_NORMS.get(doc_id, 0.0)
+        d_norm = doc_norms_get(doc_id, 0.0)
         if d_norm > 0:
             vsm_scores[doc_id] = dot / (q_norm * d_norm)
 
     # Title signal: simple term-overlap count against each document's
     # title zone (indexer.py's title_postings) -- these postings lists are
     # bounded by TITLE_ZONE_WORDS, so much cheaper than the main index.
-    title_totals: Dict[str, float] = {}
+    title_totals: Dict[str, float] = defaultdict(float)
     for term, count in term_counts.items():
-        tpost = _INDEX.title_postings.get(term)
+        tpost = title_postings_get(term)
         if not tpost:
             continue
         for doc_id, tf in tpost.items():
-            title_totals[doc_id] = title_totals.get(doc_id, 0.0) + count * tf
+            title_totals[doc_id] += count * tf
 
     bm25_lo, bm25_hi = _minmax(bm25_totals)
     vsm_lo, vsm_hi = _minmax(vsm_scores)
