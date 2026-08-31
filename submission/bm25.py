@@ -85,15 +85,20 @@ def score(query: str, k: int, k1: float = 1.2, b: float = 0.75) -> List[Tuple[st
     # sum(df(term) for term in terms) work -- the minimum possible --
     # with an identical score formula, just accumulated in a different
     # order.
-    totals: Dict[str, float] = {}
+    # Keyed by doc_idx (int), not doc_id string -- InvertedIndex.postings
+    # is doc_idx-keyed (see indexer.py), so this accumulation never hashes
+    # a doc_id string at all. Converted to the real doc_id only once, per
+    # candidate, right before the final sort below.
+    totals: Dict[int, float] = {}
     for term in terms:
         idf = _idf(term)
-        for doc_id, tf in _INDEX.postings.get(term, {}).items():
-            doc_len = _INDEX.doc_len[doc_id]
+        for doc_idx, tf in _INDEX.postings.get(term, {}).items():
+            doc_len = _INDEX.doc_len[doc_idx]
             contribution = idf * _saturated_tf(tf, doc_len, k1, b)
-            totals[doc_id] = totals.get(doc_id, 0.0) + contribution
+            totals[doc_idx] = totals.get(doc_idx, 0.0) + contribution
 
-    scores = list(totals.items())
+    doc_ids = _INDEX.doc_ids
+    scores = [(doc_ids[doc_idx], s) for doc_idx, s in totals.items()]
 
     # Sort by score desc, doc_id asc as a tie-break. Dict iteration order
     # (insertion order in modern Python) isn't itself hash-randomized, but

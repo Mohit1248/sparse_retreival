@@ -118,23 +118,26 @@ TITLE_ZONE_WORDS = 9
 
 
 def _encode_postings(
-    postings: Dict[str, Dict[str, int]], doc_id_to_idx: Dict[str, int]
+    postings: Dict[str, Dict[int, int]],
 ) -> Tuple[List[str], List[int], bytes, bytes]:
     """Shared by save() for both self.postings and self.title_postings --
     see save()'s docstring for the encoding scheme. Returns
     (terms, per-term posting counts, gaps bytes, tfs bytes).
 
-    No per-term sort: doc_id_to_idx assigns indices in corpus encounter
-    order (see save()), and build() inserts a doc_id into postings[term]
+    postings is already {term: {doc_idx: tf}} -- InvertedIndex.build()
+    assigns each doc its integer index the moment it's first seen (see
+    build()), so there is no separate doc_id-string-to-index translation
+    step here at all (there used to be: a doc_id_to_idx[doc_id] dict
+    lookup on every one of ~13M+ postings, now gone entirely). No
+    per-term sort either: build() inserts a doc_idx into postings[term]
     exactly once -- the first time that term appears in that document --
-    walking the corpus in a single forward pass. Since Python dicts
-    preserve insertion order, postings[term] is therefore already in
-    increasing doc-index order by construction; a linear scan is enough.
-    Sorting ~13M+ (doc_idx, tf) pairs across all terms used to be the
-    single largest chunk of index-build time. If this invariant is ever
-    violated (e.g. build() starts inserting out of corpus order), the
-    unsigned array.array("I") construction below fails loudly on the
-    resulting negative gap rather than silently corrupting the index.
+    walking the corpus in a single forward pass in increasing-doc_idx
+    order, and Python dicts preserve insertion order, so postings[term]
+    is therefore already in increasing doc-index order by construction; a
+    linear scan is enough. If this invariant is ever violated (e.g.
+    build() starts inserting out of corpus order), the unsigned
+    array.array("I") construction below fails loudly on the resulting
+    negative gap rather than silently corrupting the index.
     """
     terms = sorted(postings.keys())
     gaps: List[int] = []
@@ -144,8 +147,7 @@ def _encode_postings(
         term_postings = postings[term]
         term_counts.append(len(term_postings))
         prev_idx = 0
-        for doc_id, tf in term_postings.items():
-            doc_idx = doc_id_to_idx[doc_id]
+        for doc_idx, tf in term_postings.items():
             gaps.append(doc_idx - prev_idx)
             tfs.append(tf)
             prev_idx = doc_idx
@@ -153,22 +155,25 @@ def _encode_postings(
 
 
 def _decode_postings(
-    terms: List[str], term_counts: List[int], gaps_bytes: bytes, tfs_bytes: bytes, doc_ids: List[str]
-) -> Dict[str, Dict[str, int]]:
-    """Inverse of _encode_postings."""
+    terms: List[str], term_counts: List[int], gaps_bytes: bytes, tfs_bytes: bytes
+) -> Dict[str, Dict[int, int]]:
+    """Inverse of _encode_postings. Returns {term: {doc_idx: tf}} --
+    doc_idx stays an int; scorers convert to the real doc_id string only
+    when constructing their final (doc_id, score) results (see
+    InvertedIndex.doc_ids), so no doc_ids list is needed here."""
     gaps = array.array("I")
     gaps.frombytes(gaps_bytes)
     tfs = array.array("I")
     tfs.frombytes(tfs_bytes)
 
-    postings: Dict[str, Dict[str, int]] = {}
+    postings: Dict[str, Dict[int, int]] = {}
     pos = 0
     for term, count in zip(terms, term_counts):
-        term_postings: Dict[str, int] = {}
+        term_postings: Dict[int, int] = {}
         doc_idx = 0
         for i in range(pos, pos + count):
             doc_idx += gaps[i]
-            term_postings[doc_ids[doc_idx]] = tfs[i]
+            term_postings[doc_idx] = tfs[i]
         postings[term] = term_postings
         pos += count
     return postings
@@ -182,14 +187,23 @@ class InvertedIndex:
     """
 
     def __init__(self):
-        self.postings: Dict[str, Dict[str, int]] = {}  # term -> {doc_id: term_freq}
-        # term -> {doc_id: term_freq}, restricted to each document's first
+        # term -> {doc_idx: term_freq}. Keyed by each doc's integer index
+        # (assigned in corpus encounter order, see build()), not the raw
+        # doc_id string -- every scorer's hot loop hashes this key on the
+        # order of millions of times per query/build, and hashing/
+        # comparing a small int is far cheaper than a ~40-char string.
+        # self.doc_ids below maps back to the real doc_id string; scorers
+        # only need that conversion once, when constructing their final
+        # (doc_id, score) results, not on every posting.
+        self.postings: Dict[str, Dict[int, int]] = {}
+        # term -> {doc_idx: term_freq}, restricted to each document's first
         # TITLE_ZONE_WORDS words -- see TITLE_ZONE_WORDS' docstring above
         # for why this (not a separate corpus field) is the title-zone
         # source. Read by submission/custom_scorer.py for title-weighted
         # scoring; bm25.py/boolean_vsm.py ignore it entirely.
-        self.title_postings: Dict[str, Dict[str, int]] = {}
-        self.doc_len: Dict[str, int] = {}  # doc_id -> number of tokens
+        self.title_postings: Dict[str, Dict[int, int]] = {}
+        self.doc_ids: List[str] = []  # doc_idx -> doc_id
+        self.doc_len: List[int] = []  # doc_idx -> number of tokens
         self.N: int = 0  # number of documents
         self.avg_doc_len: float = 0.0
 
@@ -198,33 +212,38 @@ class InvertedIndex:
         submission.corpus_utils.load_corpus().
 
         Tokenizes each document, populates self.postings, self.title_postings,
-        self.doc_len, self.N, and self.avg_doc_len. Raw document text is not
-        retained — BM25/VSM only need term-frequency and length statistics,
-        and keeping it around would inflate the graded on-disk index size
-        for no query-time benefit.
+        self.doc_ids, self.doc_len, self.N, and self.avg_doc_len. Raw document
+        text is not retained — BM25/VSM only need term-frequency and length
+        statistics, and keeping it around would inflate the graded on-disk
+        index size for no query-time benefit.
         """
         total_len = 0
         postings = self.postings
         title_postings = self.title_postings
+        doc_ids = self.doc_ids
+        doc_len = self.doc_len
 
         for doc_id, text in corpus:
+            doc_idx = len(doc_ids)  # next integer index, in encounter order
+            doc_ids.append(doc_id)
+
             tokens = tokenize(text)
 
-            self.doc_len[doc_id] = len(tokens)
+            doc_len.append(len(tokens))
             total_len += len(tokens)
 
             # Counter(tokens) is a C-accelerated bulk count (CPython's
             # Counter.update has a fast path for exactly this) -- same
-            # multiset of counts as the old manual get()/increment loop,
-            # just without a Python-level dict.get() call per token
-            # occurrence (tens of millions across the full corpus).
+            # multiset of counts as a manual get()/increment loop, just
+            # without a Python-level dict.get() call per token occurrence
+            # (tens of millions across the full corpus).
             for term, count in Counter(tokens).items():
                 # setdefault does the "look up this term's bucket, create
-                # it if missing" step as one dict operation instead of the
-                # old `if term not in postings: postings[term] = {}` (a
+                # it if missing" step as one dict operation instead of
+                # `if term not in postings: postings[term] = {}` (a
                 # separate membership check plus, on a new term, a second
                 # insert) followed by a third lookup to fetch it back.
-                postings.setdefault(term, {})[doc_id] = count
+                postings.setdefault(term, {})[doc_idx] = count
 
             # maxsplit stops after TITLE_ZONE_WORDS splits instead of
             # splitting the whole (possibly long) document just to slice
@@ -232,9 +251,9 @@ class InvertedIndex:
             # anything longer than the title zone itself.
             title_zone_text = " ".join(text.split(maxsplit=TITLE_ZONE_WORDS)[:TITLE_ZONE_WORDS])
             for term, count in Counter(tokenize(title_zone_text)).items():
-                title_postings.setdefault(term, {})[doc_id] = count
+                title_postings.setdefault(term, {})[doc_idx] = count
 
-        self.N = len(corpus)
+        self.N = len(doc_ids)
         self.avg_doc_len = total_len / self.N if self.N > 0 else 0.0
 
     def document_frequency(self, term: str) -> int:
@@ -275,24 +294,18 @@ class InvertedIndex:
              would be catastrophic for index-build-time; level 3 gives
              nearly all of the size win for a small, bounded time cost.
         """
-        # Corpus encounter order, not alphabetical -- _encode_postings()
-        # relies on this matching the order build() inserted doc_ids into
-        # postings[term], so postings entries come out pre-sorted by doc
-        # index with no separate sort pass needed. Nothing else depends on
-        # doc_ids being alphabetically sorted (scorers tie-break on the
-        # doc_id string itself, not array position).
-        doc_ids = list(self.doc_len.keys())
-        doc_id_to_idx = {doc_id: i for i, doc_id in enumerate(doc_ids)}
-        doc_len_arr = [self.doc_len[doc_id] for doc_id in doc_ids]
-
-        terms, term_counts, gaps_bytes, tfs_bytes = _encode_postings(self.postings, doc_id_to_idx)
+        # self.postings/self.title_postings are already {term: {doc_idx:
+        # tf}} (build() assigns doc_idx directly, see __init__/build()'s
+        # docstrings) -- no doc_id-to-index translation step needed here
+        # at all.
+        terms, term_counts, gaps_bytes, tfs_bytes = _encode_postings(self.postings)
         title_terms, title_term_counts, title_gaps_bytes, title_tfs_bytes = _encode_postings(
-            self.title_postings, doc_id_to_idx
+            self.title_postings
         )
 
         payload = {
-            "doc_ids": doc_ids,
-            "doc_len": doc_len_arr,
+            "doc_ids": self.doc_ids,
+            "doc_len": self.doc_len,
             "N": self.N,
             "avg_doc_len": self.avg_doc_len,
             "terms": terms,
@@ -315,31 +328,28 @@ class InvertedIndex:
         """Reconstruct an InvertedIndex purely from what save() wrote to
         `index_dir`. Called in a fresh process — do not rely on any state
         other than what's actually on disk in `index_dir`. Rebuilds the
-        exact same self.postings / self.doc_len shapes (string-keyed) that
-        build() produces, so every scorer module is unaffected by this
-        on-disk encoding.
+        exact same self.postings / self.doc_ids / self.doc_len shapes
+        (doc_idx-keyed) that build() produces, so every scorer module is
+        unaffected by this on-disk encoding.
         """
         path = os.path.join(index_dir, "index.bin")
         with open(path, "rb") as f:
             blob = f.read()
         payload = pickle.loads(zlib.decompress(blob))
 
-        doc_ids: List[str] = payload["doc_ids"]
-        doc_len_arr: List[int] = payload["doc_len"]
-
         idx = cls()
-        idx.doc_len = {doc_id: length for doc_id, length in zip(doc_ids, doc_len_arr)}
+        idx.doc_ids = payload["doc_ids"]
+        idx.doc_len = payload["doc_len"]
         idx.N = payload["N"]
         idx.avg_doc_len = payload["avg_doc_len"]
         idx.postings = _decode_postings(
-            payload["terms"], payload["term_counts"], payload["gaps_bytes"], payload["tfs_bytes"], doc_ids
+            payload["terms"], payload["term_counts"], payload["gaps_bytes"], payload["tfs_bytes"]
         )
         idx.title_postings = _decode_postings(
             payload["title_terms"],
             payload["title_term_counts"],
             payload["title_gaps_bytes"],
             payload["title_tfs_bytes"],
-            doc_ids,
         )
 
         return idx

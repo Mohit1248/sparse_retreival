@@ -126,17 +126,21 @@ def score(query: str, k: int) -> List[Tuple[str, float]]:
     # LOAD_ATTR) re-walked on every one of those iterations.
     postings_get = _INDEX.postings.get
     title_postings_get = _INDEX.title_postings.get
-    doc_len_map = _INDEX.doc_len
+    doc_len_arr = _INDEX.doc_len  # doc_idx -> length, a list (see indexer.py)
     avg_doc_len = _INDEX.avg_doc_len
     k1, b = _K1, _B
     k1_plus_1 = k1 + 1  # same fixed float bm25._saturated_tf recomputed on every call
 
-    # defaultdict(float): same accumulation arithmetic as the old
-    # `d.get(doc_id, 0.0) + v` / `d[doc_id] = ...` pair, just without a
+    # Keyed by doc_idx (int), not doc_id string -- InvertedIndex.postings
+    # is doc_idx-keyed (see indexer.py), so every accumulation dict below
+    # hashes a small int instead of a ~40-char doc_id string, on the order
+    # of millions of times per query for this corpus's high-df terms.
+    # defaultdict(float): same accumulation arithmetic as a
+    # `d.get(doc_idx, 0.0) + v` / `d[doc_idx] = ...` pair, just without a
     # bound-method .get() call on every posting -- identical floats out,
     # fewer bytecodes to get there.
-    bm25_totals: Dict[str, float] = defaultdict(float)
-    vsm_dot: Dict[str, float] = defaultdict(float)
+    bm25_totals: Dict[int, float] = defaultdict(float)
+    vsm_dot: Dict[int, float] = defaultdict(float)
     for term, count in term_counts.items():
         postings = postings_get(term)
         if not postings:
@@ -147,41 +151,41 @@ def score(query: str, k: int) -> List[Tuple[str, float]]:
         # query term has idf 0) -- avoids a second idf lookup otherwise.
         q_weight = q_vec.get(term, 0.0) if q_norm > 0 else 0.0
         idf_vsm = boolean_vsm._idf(term) if q_weight else 0.0
-        # count * idf_bm25 doesn't depend on doc_id -- the old code
+        # count * idf_bm25 doesn't depend on doc_idx -- the old code
         # recomputed this identical product on every posting in this
         # term's list (up to ~60k times for a high-df COVID term) even
         # though Python never hoists loop-invariant subexpressions for
         # you. Same two floats multiplied once instead of N times is
         # bit-identical, just without the redundant work.
         bm25_coeff = count * idf_bm25
-        for doc_id, tf in postings.items():
+        for doc_idx, tf in postings.items():
             # Inlined bm25._saturated_tf: identical formula, same
             # operation order, just without a Python function-call per
             # posting (this loop body runs millions of times per query
             # on the high-df terms this corpus is full of).
-            length_adjustment = 1 - b + b * (doc_len_map[doc_id] / avg_doc_len)
+            length_adjustment = 1 - b + b * (doc_len_arr[doc_idx] / avg_doc_len)
             saturated = (tf * k1_plus_1) / (tf + k1 * length_adjustment)
-            bm25_totals[doc_id] += bm25_coeff * saturated
+            bm25_totals[doc_idx] += bm25_coeff * saturated
             if q_weight:
-                vsm_dot[doc_id] += q_weight * (tf * idf_vsm)
+                vsm_dot[doc_idx] += q_weight * (tf * idf_vsm)
 
-    vsm_scores: Dict[str, float] = {}
+    vsm_scores: Dict[int, float] = {}
     doc_norms_get = boolean_vsm._DOC_NORMS.get
-    for doc_id, dot in vsm_dot.items():
-        d_norm = doc_norms_get(doc_id, 0.0)
+    for doc_idx, dot in vsm_dot.items():
+        d_norm = doc_norms_get(doc_idx, 0.0)
         if d_norm > 0:
-            vsm_scores[doc_id] = dot / (q_norm * d_norm)
+            vsm_scores[doc_idx] = dot / (q_norm * d_norm)
 
     # Title signal: simple term-overlap count against each document's
     # title zone (indexer.py's title_postings) -- these postings lists are
     # bounded by TITLE_ZONE_WORDS, so much cheaper than the main index.
-    title_totals: Dict[str, float] = defaultdict(float)
+    title_totals: Dict[int, float] = defaultdict(float)
     for term, count in term_counts.items():
         tpost = title_postings_get(term)
         if not tpost:
             continue
-        for doc_id, tf in tpost.items():
-            title_totals[doc_id] += count * tf
+        for doc_idx, tf in tpost.items():
+            title_totals[doc_idx] += count * tf
 
     bm25_lo, bm25_hi = _minmax(bm25_totals)
     vsm_lo, vsm_hi = _minmax(vsm_scores)
@@ -191,21 +195,25 @@ def score(query: str, k: int) -> List[Tuple[str, float]]:
     # dicts up front, and select the top k with a partial heap instead of
     # sorting the whole (possibly near-corpus-size) candidate set -- same
     # (-score, doc_id) tie-break as a full sort would give, just O(n log k)
-    # instead of O(n log n).
+    # instead of O(n log n). doc_idx -> doc_id string conversion happens
+    # right here, the one place it's actually needed (the interface
+    # contract and the tie-break both need the real doc_id string, not the
+    # index) -- everything upstream stays in cheaper int-keyed dicts.
     #
     # candidate_docs is just bm25_totals's keys, not a 3-way set union:
-    # vsm_dot and title_totals are only ever populated for doc_ids that
+    # vsm_dot and title_totals are only ever populated for doc_idxs that
     # bm25_totals already has an entry for (same _INDEX.postings[term]
     # walk for VSM; the title zone is always a prefix of the same doc's
     # full text, tokenized the same way, so any term in title_postings[t]
     # is necessarily also in postings[t]) -- so both are always subsets.
+    doc_ids = _INDEX.doc_ids
     combined = (
         (
-            doc_id,
+            doc_ids[doc_idx],
             _BM25_WEIGHT * _norm(raw_bm25, bm25_lo, bm25_hi)
-            + _VSM_WEIGHT * _norm(vsm_scores.get(doc_id), vsm_lo, vsm_hi)
-            + _TITLE_WEIGHT * _norm(title_totals.get(doc_id), title_lo, title_hi),
+            + _VSM_WEIGHT * _norm(vsm_scores.get(doc_idx), vsm_lo, vsm_hi)
+            + _TITLE_WEIGHT * _norm(title_totals.get(doc_idx), title_lo, title_hi),
         )
-        for doc_id, raw_bm25 in bm25_totals.items()
+        for doc_idx, raw_bm25 in bm25_totals.items()
     )
     return heapq.nsmallest(k, combined, key=lambda pair: (-pair[1], pair[0]))

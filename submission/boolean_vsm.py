@@ -64,14 +64,14 @@ def build(index: InvertedIndex) -> None:
     global _INDEX, _DOC_NORMS
     _INDEX = index
 
-    doc_sq_sums: dict = {}  # doc_id -> running total of (weight^2)
+    doc_sq_sums: dict = {}  # doc_idx -> running total of (weight^2)
     for term, postings in _INDEX.postings.items():
         idf = _idf(term)
-        for doc_id, tf in postings.items():
+        for doc_idx, tf in postings.items():
             weight = tf * idf
-            doc_sq_sums[doc_id] = doc_sq_sums.get(doc_id, 0.0) + weight * weight
+            doc_sq_sums[doc_idx] = doc_sq_sums.get(doc_idx, 0.0) + weight * weight
 
-    _DOC_NORMS = {doc_id: math.sqrt(sq_sum) for doc_id, sq_sum in doc_sq_sums.items()}
+    _DOC_NORMS = {doc_idx: math.sqrt(sq_sum) for doc_idx, sq_sum in doc_sq_sums.items()}  # doc_idx -> norm
 
 
 def boolean_search(query: str, mode: str = "and") -> List[str]:
@@ -82,14 +82,15 @@ def boolean_search(query: str, mode: str = "and") -> List[str]:
     if not terms:
         return []
 
-    doc_sets = [set(_INDEX.postings.get(term, {}).keys()) for term in terms]
+    doc_sets = [set(_INDEX.postings.get(term, {}).keys()) for term in terms]  # sets of doc_idx
 
     if mode == "and":
         matching_docs = set.intersection(*doc_sets)
     else:  # mode == "or"
         matching_docs = set.union(*doc_sets)
 
-    return list(matching_docs)
+    doc_ids = _INDEX.doc_ids
+    return [doc_ids[doc_idx] for doc_idx in matching_docs]
 
 
 def _query_vector(terms: List[str]) -> dict:
@@ -114,24 +115,25 @@ def vsm_score(query: str, k: int) -> List[Tuple[str, float]]:
     if q_norm == 0:
         return []
 
-    candidate_docs = set()                                    # step 2
+    candidate_docs = set()                                    # step 2 (doc_idx)
     for term in q_vec:
         candidate_docs.update(_INDEX.postings.get(term, {}).keys())
 
+    doc_ids = _INDEX.doc_ids
     scores = []
-    for doc_id in candidate_docs:
+    for doc_idx in candidate_docs:
         dot = 0.0                                             # step 3
         for term, q_weight in q_vec.items():
-            tf = _INDEX.postings.get(term, {}).get(doc_id, 0)
+            tf = _INDEX.postings.get(term, {}).get(doc_idx, 0)
             if tf == 0:
                 continue
             d_weight = tf * _idf(term)
             dot += q_weight * d_weight
 
-        d_norm = _DOC_NORMS.get(doc_id, 0.0)
+        d_norm = _DOC_NORMS.get(doc_idx, 0.0)
         if d_norm == 0:
             continue
-        scores.append((doc_id, dot / (q_norm * d_norm)))       # step 4
+        scores.append((doc_ids[doc_idx], dot / (q_norm * d_norm)))  # step 4
 
     # Score desc, doc_id asc tie-break -- see bm25.py's score() for why
     # (candidate_docs comes from a hash-randomized set, so without this the
