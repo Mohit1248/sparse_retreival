@@ -28,21 +28,45 @@ near the top) against the full dev set. The curve is a smooth, broad
 peak around 0.75 (0.6638 at 1.0 -- pure BM25 -- rising to 0.6735 at
 0.75, then gently falling back toward 1.0), not an isolated spike, and
 every metric (nDCG@10, MAP@10, MRR, P@10) improves together at that
-point versus pure BM25 -- evidence this reflects a real signal rather
-than fitting noise in these 50 dev queries.
+point versus pure BM25 on this corpus.
 
-Title signal: a third component scores overlap with each document's
-title zone (indexer.py's title_postings -- see TITLE_ZONE_WORDS'
-docstring there for why that's a leading-word-count heuristic and not a
-separate corpus field or punctuation split). Grid-searched jointly with
-the title zone's word count against the full dev set: a broad plateau
-across word-count 7-9 and title weight 0.15-0.25 (not a single sharp
-spike -- e.g. K=8/w=0.20 -> 0.6907, K=9/w=0.15 -> 0.6959, K=9/w=0.20 ->
-0.6958, all close together), landing on K=9 words / weight 0.20 as a
-point solidly inside that plateau rather than the single best-observed
-value (which risks being fine-grained noise on only 50 dev queries).
-That takes nDCG@10 from 0.6735 (BM25+VSM alone) to 0.6958 -- a further
-real gain on top of the blend weight tuning above.
+Same problem as the title weight, though: that 0.75 peak was only ever
+checked against this one corpus. Cross-checked against a structurally
+different corpus, adding VSM weight *monotonically hurts* it at every
+level tested -- no peak, no compensating benefit anywhere, pure BM25 is
+that corpus's best point in the whole sweep. Not a full sign-flip like
+the title weight (VSM never actively helps this corpus, it just costs
+it by varying amounts), but a real, one-sided overfitting risk in the
+same family. Rather than either extreme -- 0.75 (locally optimal here,
+costs the other corpus the most) or dropping VSM entirely to 0.0/1.0
+(optimal for the other corpus specifically, which risks the same
+mistake in the opposite direction: fitting to that corpus's optimum
+instead of this one's), landed on 0.90/0.10 as the point that scores
+best summed across both rather than the best on either alone -- keeps
+most of this corpus's blend benefit while giving up little of the
+other's.
+
+Title signal: a third component (mechanism still present, weight
+currently 0 -- see below) scores overlap with each document's title zone
+(indexer.py's title_postings -- see TITLE_ZONE_WORDS' docstring there for
+why that's a leading-word-count heuristic and not a separate corpus field
+or punctuation split). Grid-searched jointly with the title zone's word
+count against the full dev set, it looked like a real win in isolation:
+a broad plateau across word-count 7-9 and title weight 0.15-0.25 (e.g.
+K=9/w=0.20 -> 0.6958 vs. 0.6735 without it), not an isolated spike.
+
+But that grid search only ever validated against this one corpus's 50 dev
+queries. Cross-checked against a structurally different corpus (short,
+title-less passages instead of long titled documents), the same weight
+sweep reverses sign entirely -- raising the title weight steadily
+*helped* this corpus's dev nDCG@10 and steadily *hurt* the other one's,
+which is the signature of fitting this corpus's document structure
+(informative titles) rather than a transferable ranking signal. Since
+the held-out evaluation corpus's structure isn't something this can
+verify in advance, the title term is kept in the code (score() still
+computes it correctly whenever _TITLE_WEIGHT is nonzero) but its weight
+is set to 0 by default -- BM25's k1/b, by contrast, showed no such
+sign-flip across corpora and were kept at their tuned values.
 
 If you use this, wire it in from submission/retrieve.py's retrieve()
 instead of calling a single scorer directly, and describe what you did
@@ -62,11 +86,32 @@ _INDEX: Optional[InvertedIndex] = None
 # BM25/VSM/title blend weights and BM25's k1/b -- kept as defaults here
 # (not re-exposed as score() parameters) so retrieve.py's call stays
 # simple; see the report for the grid search behind these values.
-_TITLE_WEIGHT = 0.20
-_BM25_WEIGHT = (1 - _TITLE_WEIGHT) * 0.75
-_VSM_WEIGHT = (1 - _TITLE_WEIGHT) * 0.25
-_K1 = 2.50
-_B = 0.60
+#
+# _TITLE_WEIGHT is 0 despite grid-searching better on this corpus's dev
+# queries alone -- see the module docstring's "Title signal" section for
+# why that plateau didn't survive a cross-corpus check and was judged too
+# corpus-specific to trust on an unseen held-out set.
+_TITLE_WEIGHT = 0.0
+# 0.90/0.10, not this corpus's locally-optimal 0.75/0.25 -- see the module
+# docstring's "Blend weight" section: VSM's benefit here doesn't transfer
+# to a structurally different corpus (monotonically costs it instead), so
+# this is deliberately the best-summed-across-both point, not either
+# corpus's individual optimum.
+_BM25_WEIGHT = (1 - _TITLE_WEIGHT) * 0.90
+_VSM_WEIGHT = (1 - _TITLE_WEIGHT) * 0.10
+#
+# k1=1.60, b=0.50 (was k1=2.50, b=0.60): b controls how strongly document
+# length is normalised, and lowering it costs this corpus's dev nDCG@10
+# only ~2% while meaningfully helping a structurally different, more
+# uniform-length corpus used as a cross-corpus check -- moving to it was a
+# net improvement on the SUM of both corpora's nDCG@10, not just a
+# compromise. k1 alone showed no comparable cross-corpus benefit; b is the
+# axis that matters here. Kept, unlike the title weight above, because
+# this is a smooth trade-off curve (no sign flip), not a fit that reverses
+# outright -- 1.60/0.50 is simply a better point on that curve for
+# performing acceptably on both rather than optimally on only one.
+_K1 = 1.60
+_B = 0.50
 
 
 def build(index: InvertedIndex) -> None:
@@ -179,13 +224,17 @@ def score(query: str, k: int) -> List[Tuple[str, float]]:
     # Title signal: simple term-overlap count against each document's
     # title zone (indexer.py's title_postings) -- these postings lists are
     # bounded by TITLE_ZONE_WORDS, so much cheaper than the main index.
+    # Skipped entirely when _TITLE_WEIGHT is 0 (its current default, see
+    # module docstring) -- no point walking title_postings for a term
+    # whose contribution is about to be multiplied by 0 anyway.
     title_totals: Dict[int, float] = defaultdict(float)
-    for term, count in term_counts.items():
-        tpost = title_postings_get(term)
-        if not tpost:
-            continue
-        for doc_idx, tf in tpost.items():
-            title_totals[doc_idx] += count * tf
+    if _TITLE_WEIGHT:
+        for term, count in term_counts.items():
+            tpost = title_postings_get(term)
+            if not tpost:
+                continue
+            for doc_idx, tf in tpost.items():
+                title_totals[doc_idx] += count * tf
 
     bm25_lo, bm25_hi = _minmax(bm25_totals)
     vsm_lo, vsm_hi = _minmax(vsm_scores)
