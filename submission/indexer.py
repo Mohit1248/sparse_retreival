@@ -209,6 +209,48 @@ def _unpack_tfs(l0_bytes: bytes, l1_bytes: bytes) -> List[int]:
     return [v if v != _TF_ESCAPE_B else next(l1_iter) for v in l0]
 
 
+def _front_code(sorted_terms: List[str]) -> Tuple[bytes, bytes]:
+    """Front-coding for save()'s `terms` vocabulary list (already sorted
+    alphabetically, see _encode_postings): each term is stored as (length
+    of the prefix shared with the previous term, remaining suffix), so
+    adjacent stemmed English words sharing a long root (e.g. consecutive
+    entries in a sorted vocabulary very often do) don't repeat those
+    shared characters. Assumes no shared prefix exceeds 255 characters --
+    true for any realistic tokenized term (tokenize() only ever extracts
+    [a-z0-9]+ substrings from natural-language text, never anywhere near
+    that long) -- and fails loudly via the array('B') construction below
+    if it ever isn't, rather than silently truncating. Suffixes are
+    joined with a NUL separator, which tokenize() can never itself
+    produce.
+    """
+    prefix_lens: List[int] = []
+    suffixes: List[str] = []
+    prev = ""
+    for term in sorted_terms:
+        limit = min(len(prev), len(term))
+        plen = 0
+        while plen < limit and prev[plen] == term[plen]:
+            plen += 1
+        prefix_lens.append(plen)
+        suffixes.append(term[plen:])
+        prev = term
+    return array.array("B", prefix_lens).tobytes(), "\x00".join(suffixes).encode("utf-8")
+
+
+def _front_decode(prefix_lens_bytes: bytes, suffixes_blob: bytes) -> List[str]:
+    """Inverse of _front_code."""
+    prefix_lens = array.array("B")
+    prefix_lens.frombytes(prefix_lens_bytes)
+    suffixes = suffixes_blob.decode("utf-8").split("\x00")
+    terms: List[str] = []
+    prev = ""
+    for plen, suf in zip(prefix_lens, suffixes):
+        term = prev[:plen] + suf
+        terms.append(term)
+        prev = term
+    return terms
+
+
 def _encode_postings(
     postings: Dict[str, Dict[int, int]],
 ) -> Tuple[List[str], List[int], bytes, bytes, bytes, bytes, bytes]:
@@ -414,19 +456,45 @@ class InvertedIndex:
             title_tfs_l1,
         ) = _encode_postings(self.title_postings)
 
+        # Front-code `terms` (sorted, so adjacent entries very often share
+        # a long stemmed root) instead of storing each string in full --
+        # see _front_code's docstring.
+        term_prefix_lens, term_suffixes = _front_code(terms)
+
+        # title_postings' vocabulary is always a subset of self.postings'
+        # (the title zone is a prefix of the same document's full text,
+        # tokenized the same way -- see custom_scorer.py's docstring for
+        # the same invariant used there), so title_terms never needs its
+        # own strings at all: store where each one falls in the already-
+        # stored `terms` list instead, as gap-encoded (title vocabularies
+        # cluster near each other alphabetically far more than doc-idx
+        # gaps do) indices packed with the same cascade used for postings
+        # gaps above.
+        term_to_idx = {t: i for i, t in enumerate(terms)}
+        title_term_idx_gaps: List[int] = []
+        prev_idx = 0
+        for t in title_terms:
+            ti = term_to_idx[t]
+            title_term_idx_gaps.append(ti - prev_idx)
+            prev_idx = ti
+        title_idx_l0, title_idx_l1, title_idx_l2 = _pack_gaps(title_term_idx_gaps)
+
         payload = {
             "doc_ids": self.doc_ids,
             "doc_len": self.doc_len,
             "N": self.N,
             "avg_doc_len": self.avg_doc_len,
-            "terms": terms,
+            "term_prefix_lens": term_prefix_lens,
+            "term_suffixes": term_suffixes,
             "term_counts": term_counts,
             "gaps_l0": gaps_l0,
             "gaps_l1": gaps_l1,
             "gaps_l2": gaps_l2,
             "tfs_l0": tfs_l0,
             "tfs_l1": tfs_l1,
-            "title_terms": title_terms,
+            "title_idx_l0": title_idx_l0,
+            "title_idx_l1": title_idx_l1,
+            "title_idx_l2": title_idx_l2,
             "title_term_counts": title_term_counts,
             "title_gaps_l0": title_gaps_l0,
             "title_gaps_l1": title_gaps_l1,
@@ -459,8 +527,10 @@ class InvertedIndex:
         idx.doc_len = payload["doc_len"]
         idx.N = payload["N"]
         idx.avg_doc_len = payload["avg_doc_len"]
+
+        terms = _front_decode(payload["term_prefix_lens"], payload["term_suffixes"])
         idx.postings = _decode_postings(
-            payload["terms"],
+            terms,
             payload["term_counts"],
             payload["gaps_l0"],
             payload["gaps_l1"],
@@ -468,8 +538,22 @@ class InvertedIndex:
             payload["tfs_l0"],
             payload["tfs_l1"],
         )
+
+        # Inverse of save()'s title-vocabulary encoding: title_terms was
+        # never stored as strings, only as gap-encoded indices into
+        # `terms` (title_postings' vocabulary is always a subset of
+        # self.postings', see save()'s comment there).
+        title_term_idx_gaps = _unpack_gaps(
+            payload["title_idx_l0"], payload["title_idx_l1"], payload["title_idx_l2"]
+        )
+        title_terms: List[str] = []
+        idx_pos = 0
+        for gap in title_term_idx_gaps:
+            idx_pos += gap
+            title_terms.append(terms[idx_pos])
+
         idx.title_postings = _decode_postings(
-            payload["title_terms"],
+            title_terms,
             payload["title_term_counts"],
             payload["title_gaps_l0"],
             payload["title_gaps_l1"],
