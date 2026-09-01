@@ -49,10 +49,12 @@ _STEMMER = PorterStemmer()
 # assert them rather than silently risking corruption if they ever don't.
 assert array.array("I").itemsize == 4, "array('I') is not 4 bytes on this platform"
 assert array.array("H").itemsize == 2, "array('H') is not 2 bytes on this platform"
+assert array.array("B").itemsize == 1, "array('B') is not 1 byte on this platform"
 
-# Sentinel used by _encode_postings/_decode_postings' narrow+overflow gap
-# and tf encoding, below.
-_NARROW_ESCAPE = 0xFFFF
+# Escape sentinels for _pack_gaps/_pack_tfs' cascading encoding, below.
+_GAP_ESCAPE_B = 0xFF     # array('B') tier: value 0-254 direct, 255 = escape to H tier
+_GAP_ESCAPE_H = 0xFFFF   # array('H') tier: value 0-65534 direct, 65535 = escape to I tier
+_TF_ESCAPE_B = 0xFF      # array('B') tier: value 0-254 direct, 255 = escape to I tier
 
 
 @functools.lru_cache(maxsize=None)
@@ -122,13 +124,98 @@ def tokenize(text: str) -> List[str]:
 TITLE_ZONE_WORDS = 9
 
 
+def _pack_gaps(gaps: List[int]) -> Tuple[bytes, bytes, bytes]:
+    """3-tier cascading pack: array('B') (0-254 direct, 255 = escape to
+    the H tier) -> array('H') (0-65534 direct, 65535 = escape to the I
+    tier) -> array('I') (anything, no further escape needed -- a spec
+    note (Section 3) warns the held-out corpus could be >=500K docs, and
+    32 bits comfortably covers any doc_idx gap at that scale).
+
+    Measured on the full corpus: gaps were ~65% of total index size even
+    after zlib with a flat 4-byte encoding (17.5MB of ~27MB) -- gaps for
+    common terms are mostly small (delta-encoded against a monotonically
+    increasing doc_idx: 86.3% fit in a single byte), but a rare term's
+    lone occurrence can land anywhere in a 171k+ doc corpus. zlib on a
+    flat encoding already exploited most of the redundancy *within* that
+    encoding (repeated zero bytes in small values stored wide), so the
+    remaining win comes from using fewer bytes per value to begin with,
+    not more compression effort on the same bytes (level 9 measured
+    "barely better" than level 3 on this data -- see save()'s docstring).
+    A byte-by-byte hand-rolled varint was previously measured at ~27s of
+    extra build time for a similar goal; this cascade gets most of the
+    same win from one or two cheap comparisons per value instead, still
+    packed in bulk via array.tobytes()."""
+    l0: List[int] = []
+    l1: List[int] = []
+    l2: List[int] = []
+    for g in gaps:
+        if g < _GAP_ESCAPE_B:
+            l0.append(g)
+        else:
+            l0.append(_GAP_ESCAPE_B)
+            if g < _GAP_ESCAPE_H:
+                l1.append(g)
+            else:
+                l1.append(_GAP_ESCAPE_H)
+                l2.append(g)
+    return array.array("B", l0).tobytes(), array.array("H", l1).tobytes(), array.array("I", l2).tobytes()
+
+
+def _unpack_gaps(l0_bytes: bytes, l1_bytes: bytes, l2_bytes: bytes) -> List[int]:
+    """Inverse of _pack_gaps."""
+    l0 = array.array("B")
+    l0.frombytes(l0_bytes)
+    l1 = array.array("H")
+    l1.frombytes(l1_bytes)
+    l2 = array.array("I")
+    l2.frombytes(l2_bytes)
+    l1_iter = iter(l1)
+    l2_iter = iter(l2)
+    out: List[int] = []
+    for v in l0:
+        if v != _GAP_ESCAPE_B:
+            out.append(v)
+            continue
+        v1 = next(l1_iter)
+        out.append(v1 if v1 != _GAP_ESCAPE_H else next(l2_iter))
+    return out
+
+
+def _pack_tfs(tfs: List[int]) -> Tuple[bytes, bytes]:
+    """2-tier cascading pack: array('B') (0-254 direct, 255 = escape to
+    the I tier) -> array('I') (anything -- tf is bounded by a single
+    document's token count, but real-world documents could in principle
+    repeat one term arbitrarily many times, so this still escapes rather
+    than assuming a hard cap). Measured on the full corpus: 99.99998% of
+    tfs fit in a single byte (max tf was 495 across ~12.2M postings)."""
+    l0: List[int] = []
+    l1: List[int] = []
+    for t in tfs:
+        if t < _TF_ESCAPE_B:
+            l0.append(t)
+        else:
+            l0.append(_TF_ESCAPE_B)
+            l1.append(t)
+    return array.array("B", l0).tobytes(), array.array("I", l1).tobytes()
+
+
+def _unpack_tfs(l0_bytes: bytes, l1_bytes: bytes) -> List[int]:
+    """Inverse of _pack_tfs."""
+    l0 = array.array("B")
+    l0.frombytes(l0_bytes)
+    l1 = array.array("I")
+    l1.frombytes(l1_bytes)
+    l1_iter = iter(l1)
+    return [v if v != _TF_ESCAPE_B else next(l1_iter) for v in l0]
+
+
 def _encode_postings(
     postings: Dict[str, Dict[int, int]],
-) -> Tuple[List[str], List[int], bytes, bytes, bytes, bytes]:
+) -> Tuple[List[str], List[int], bytes, bytes, bytes, bytes, bytes]:
     """Shared by save() for both self.postings and self.title_postings --
-    see save()'s docstring for the encoding scheme. Returns (terms,
-    per-term posting counts, gaps-narrow bytes, gaps-overflow bytes,
-    tfs-narrow bytes, tfs-overflow bytes).
+    see save()'s and _pack_gaps'/_pack_tfs' docstrings for the encoding
+    scheme. Returns (terms, per-term posting counts, gaps L0/L1/L2 bytes,
+    tfs L0/L1 bytes).
 
     postings is already {term: {doc_idx: tf}} -- InvertedIndex.build()
     assigns each doc its integer index the moment it's first seen (see
@@ -141,83 +228,42 @@ def _encode_postings(
     order, and Python dicts preserve insertion order, so postings[term]
     is therefore already in increasing doc-index order by construction; a
     linear scan is enough. If this invariant is ever violated (e.g.
-    build() starts inserting out of corpus order), the unsigned
-    array.array("H")/("I") construction below fails loudly on the
-    resulting negative gap rather than silently corrupting the index.
-
-    Gaps and tfs are each packed as a 2-byte array('H') value where they
-    fit (< _NARROW_ESCAPE), falling back to the sentinel _NARROW_ESCAPE
-    plus the real value appended to a parallel 4-byte array('I') overflow
-    array where they don't. Measured on the full corpus: gaps_bytes alone
-    was ~65% of total index size (17.5MB of ~27MB) with a flat 4-byte
-    encoding, even after zlib -- gaps for common terms are mostly small
-    (delta-encoded against a monotonically increasing doc_idx), but a few
-    rare terms' single occurrence can be a large gap, and tf never
-    exceeds a few hundred (bounded by a single document's token count) --
-    99.36% of gaps and effectively all tfs fit in 2 bytes on this corpus.
-    zlib on the old flat array('I') already exploited most of the
-    redundancy *within* that encoding (repeated zero bytes in small
-    values stored as 4 bytes), so the remaining win has to come from
-    using fewer bytes per value to begin with, not more compression
-    effort on the same bytes (level 9 measured "barely better" than
-    level 3 on this data -- see save()'s docstring).
+    build() starts inserting out of corpus order), the unsigned array
+    construction inside _pack_gaps fails loudly on the resulting negative
+    gap rather than silently corrupting the index.
     """
     terms = sorted(postings.keys())
-    gaps_narrow: List[int] = []
-    gaps_overflow: List[int] = []
-    tfs_narrow: List[int] = []
-    tfs_overflow: List[int] = []
+    gaps: List[int] = []
+    tfs: List[int] = []
     term_counts: List[int] = []
     for term in terms:
         term_postings = postings[term]
         term_counts.append(len(term_postings))
         prev_idx = 0
         for doc_idx, tf in term_postings.items():
-            gap = doc_idx - prev_idx
-            if gap < _NARROW_ESCAPE:
-                gaps_narrow.append(gap)
-            else:
-                gaps_narrow.append(_NARROW_ESCAPE)
-                gaps_overflow.append(gap)
-            if tf < _NARROW_ESCAPE:
-                tfs_narrow.append(tf)
-            else:
-                tfs_narrow.append(_NARROW_ESCAPE)
-                tfs_overflow.append(tf)
+            gaps.append(doc_idx - prev_idx)
+            tfs.append(tf)
             prev_idx = doc_idx
-    return (
-        terms,
-        term_counts,
-        array.array("H", gaps_narrow).tobytes(),
-        array.array("I", gaps_overflow).tobytes(),
-        array.array("H", tfs_narrow).tobytes(),
-        array.array("I", tfs_overflow).tobytes(),
-    )
+    gaps_l0, gaps_l1, gaps_l2 = _pack_gaps(gaps)
+    tfs_l0, tfs_l1 = _pack_tfs(tfs)
+    return terms, term_counts, gaps_l0, gaps_l1, gaps_l2, tfs_l0, tfs_l1
 
 
 def _decode_postings(
     terms: List[str],
     term_counts: List[int],
-    gaps_narrow_bytes: bytes,
-    gaps_overflow_bytes: bytes,
-    tfs_narrow_bytes: bytes,
-    tfs_overflow_bytes: bytes,
+    gaps_l0_bytes: bytes,
+    gaps_l1_bytes: bytes,
+    gaps_l2_bytes: bytes,
+    tfs_l0_bytes: bytes,
+    tfs_l1_bytes: bytes,
 ) -> Dict[str, Dict[int, int]]:
     """Inverse of _encode_postings. Returns {term: {doc_idx: tf}} --
     doc_idx stays an int; scorers convert to the real doc_id string only
     when constructing their final (doc_id, score) results (see
     InvertedIndex.doc_ids), so no doc_ids list is needed here."""
-    gaps_narrow = array.array("H")
-    gaps_narrow.frombytes(gaps_narrow_bytes)
-    gaps_overflow = array.array("I")
-    gaps_overflow.frombytes(gaps_overflow_bytes)
-    tfs_narrow = array.array("H")
-    tfs_narrow.frombytes(tfs_narrow_bytes)
-    tfs_overflow = array.array("I")
-    tfs_overflow.frombytes(tfs_overflow_bytes)
-
-    gaps_overflow_iter = iter(gaps_overflow)
-    tfs_overflow_iter = iter(tfs_overflow)
+    gaps = _unpack_gaps(gaps_l0_bytes, gaps_l1_bytes, gaps_l2_bytes)
+    tfs = _unpack_tfs(tfs_l0_bytes, tfs_l1_bytes)
 
     postings: Dict[str, Dict[int, int]] = {}
     pos = 0
@@ -225,10 +271,8 @@ def _decode_postings(
         term_postings: Dict[int, int] = {}
         doc_idx = 0
         for i in range(pos, pos + count):
-            g = gaps_narrow[i]
-            doc_idx += next(gaps_overflow_iter) if g == _NARROW_ESCAPE else g
-            t = tfs_narrow[i]
-            term_postings[doc_idx] = next(tfs_overflow_iter) if t == _NARROW_ESCAPE else t
+            doc_idx += gaps[i]
+            term_postings[doc_idx] = tfs[i]
         postings[term] = term_postings
         pos += count
     return postings
@@ -333,19 +377,19 @@ class InvertedIndex:
              delta-encode (store gaps between consecutive doc indices,
              not absolute values) -- gaps are usually small for common
              terms, so they pack tighter and compress better.
-          3. Pack every (gap, tf) as a 2-byte unsigned int via the stdlib
-             `array` module's C-level tobytes()/frombytes(), falling back
-             to a 4-byte value in a parallel overflow array for the rare
-             one that doesn't fit (see _encode_postings' docstring --
-             measured on the full corpus, 99.36% of gaps and effectively
-             all tfs fit in 2 bytes; a spec note (Section 3) warns the
-             held-out corpus could be >=500K docs, hence the overflow
-             escape rather than assuming everything fits). A byte-by-byte
-             hand-rolled varint (1-5 bytes depending on magnitude) was
-             measured (against the original flat 4-byte encoding) at
-             ~27s of extra index-build time from per-value function-call
-             overhead -- this two-tier narrow/overflow split gets most of
-             the same size win from a single cheap conditional per value
+          3. Pack every gap through a 3-tier cascade (1 byte, escaping to
+             2, escaping to 4) and every tf through a 2-tier cascade (1
+             byte, escaping to 4), via the stdlib `array` module's
+             C-level tobytes()/frombytes() -- see _pack_gaps'/_pack_tfs'
+             docstrings. Measured on the full corpus: 86.3% of gaps and
+             99.99998% of tfs fit in a single byte; a spec note (Section
+             3) warns the held-out corpus could be >=500K docs, hence the
+             cascading escape rather than assuming everything fits. A
+             byte-by-byte hand-rolled varint (1-5 bytes depending on
+             magnitude) was measured (against the original flat 4-byte
+             encoding) at ~27s of extra index-build time from per-value
+             function-call overhead -- this cascade gets a comparable
+             size win from one or two cheap conditionals per value
              instead, still packed in bulk via array.tobytes().
           4. zlib-compress the whole thing as a final pass (stdlib, not a
              search/indexing library -- this is generic byte compression,
@@ -359,16 +403,15 @@ class InvertedIndex:
         # tf}} (build() assigns doc_idx directly, see __init__/build()'s
         # docstrings) -- no doc_id-to-index translation step needed here
         # at all.
-        terms, term_counts, gaps_narrow_bytes, gaps_overflow_bytes, tfs_narrow_bytes, tfs_overflow_bytes = (
-            _encode_postings(self.postings)
-        )
+        terms, term_counts, gaps_l0, gaps_l1, gaps_l2, tfs_l0, tfs_l1 = _encode_postings(self.postings)
         (
             title_terms,
             title_term_counts,
-            title_gaps_narrow_bytes,
-            title_gaps_overflow_bytes,
-            title_tfs_narrow_bytes,
-            title_tfs_overflow_bytes,
+            title_gaps_l0,
+            title_gaps_l1,
+            title_gaps_l2,
+            title_tfs_l0,
+            title_tfs_l1,
         ) = _encode_postings(self.title_postings)
 
         payload = {
@@ -378,16 +421,18 @@ class InvertedIndex:
             "avg_doc_len": self.avg_doc_len,
             "terms": terms,
             "term_counts": term_counts,
-            "gaps_narrow_bytes": gaps_narrow_bytes,
-            "gaps_overflow_bytes": gaps_overflow_bytes,
-            "tfs_narrow_bytes": tfs_narrow_bytes,
-            "tfs_overflow_bytes": tfs_overflow_bytes,
+            "gaps_l0": gaps_l0,
+            "gaps_l1": gaps_l1,
+            "gaps_l2": gaps_l2,
+            "tfs_l0": tfs_l0,
+            "tfs_l1": tfs_l1,
             "title_terms": title_terms,
             "title_term_counts": title_term_counts,
-            "title_gaps_narrow_bytes": title_gaps_narrow_bytes,
-            "title_gaps_overflow_bytes": title_gaps_overflow_bytes,
-            "title_tfs_narrow_bytes": title_tfs_narrow_bytes,
-            "title_tfs_overflow_bytes": title_tfs_overflow_bytes,
+            "title_gaps_l0": title_gaps_l0,
+            "title_gaps_l1": title_gaps_l1,
+            "title_gaps_l2": title_gaps_l2,
+            "title_tfs_l0": title_tfs_l0,
+            "title_tfs_l1": title_tfs_l1,
         }
         blob = zlib.compress(pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL), level=3)
 
@@ -417,18 +462,20 @@ class InvertedIndex:
         idx.postings = _decode_postings(
             payload["terms"],
             payload["term_counts"],
-            payload["gaps_narrow_bytes"],
-            payload["gaps_overflow_bytes"],
-            payload["tfs_narrow_bytes"],
-            payload["tfs_overflow_bytes"],
+            payload["gaps_l0"],
+            payload["gaps_l1"],
+            payload["gaps_l2"],
+            payload["tfs_l0"],
+            payload["tfs_l1"],
         )
         idx.title_postings = _decode_postings(
             payload["title_terms"],
             payload["title_term_counts"],
-            payload["title_gaps_narrow_bytes"],
-            payload["title_gaps_overflow_bytes"],
-            payload["title_tfs_narrow_bytes"],
-            payload["title_tfs_overflow_bytes"],
+            payload["title_gaps_l0"],
+            payload["title_gaps_l1"],
+            payload["title_gaps_l2"],
+            payload["title_tfs_l0"],
+            payload["title_tfs_l1"],
         )
 
         return idx
