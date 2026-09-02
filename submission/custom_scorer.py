@@ -46,27 +46,25 @@ best summed across both rather than the best on either alone -- keeps
 most of this corpus's blend benefit while giving up little of the
 other's.
 
-Title signal: a third component (mechanism still present, weight
-currently 0 -- see below) scores overlap with each document's title zone
-(indexer.py's title_postings -- see TITLE_ZONE_WORDS' docstring there for
-why that's a leading-word-count heuristic and not a separate corpus field
-or punctuation split). Grid-searched jointly with the title zone's word
-count against the full dev set, it looked like a real win in isolation:
-a broad plateau across word-count 7-9 and title weight 0.15-0.25 (e.g.
-K=9/w=0.20 -> 0.6958 vs. 0.6735 without it), not an isolated spike.
-
-But that grid search only ever validated against this one corpus's 50 dev
-queries. Cross-checked against a structurally different corpus (short,
-title-less passages instead of long titled documents), the same weight
-sweep reverses sign entirely -- raising the title weight steadily
-*helped* this corpus's dev nDCG@10 and steadily *hurt* the other one's,
-which is the signature of fitting this corpus's document structure
-(informative titles) rather than a transferable ranking signal. Since
-the held-out evaluation corpus's structure isn't something this can
-verify in advance, the title term is kept in the code (score() still
-computes it correctly whenever _TITLE_WEIGHT is nonzero) but its weight
-is set to 0 by default -- BM25's k1/b, by contrast, showed no such
-sign-flip across corpora and were kept at their tuned values.
+Title signal (tried, removed): an earlier version added a third component
+scoring term overlap with each document's first few words as an
+approximate "title" zone. Grid-searched jointly with that word count
+against the full dev set, it looked like a real win in isolation (a
+broad plateau, not an isolated spike). But that grid search only ever
+validated against this one corpus's 50 dev queries -- cross-checked
+against a structurally different corpus (short, title-less passages
+instead of long titled documents), the same weight sweep reversed sign
+entirely: raising the title weight steadily helped this corpus's dev
+nDCG@10 and steadily hurt the other one's, the signature of fitting this
+corpus's document structure (informative titles) rather than a
+transferable ranking signal. Set to weight 0 first as insurance, then
+removed outright (the indexing pass that built it, and the on-disk
+fields it needed) once it was clear weight 0 was the durable answer, not
+a temporary hedge -- keeping a whole second per-document indexing pass
+and a whole extra set of persisted fields alive purely to multiply their
+output by zero cost real, measurable index-build time and on-disk index
+size for no benefit. BM25's k1/b, by contrast, showed no such sign-flip
+across corpora and were kept at their tuned values.
 
 If you use this, wire it in from submission/retrieve.py's retrieve()
 instead of calling a single scorer directly, and describe what you did
@@ -83,22 +81,17 @@ from submission.indexer import InvertedIndex, tokenize
 
 _INDEX: Optional[InvertedIndex] = None
 
-# BM25/VSM/title blend weights and BM25's k1/b -- kept as defaults here
-# (not re-exposed as score() parameters) so retrieve.py's call stays
-# simple; see the report for the grid search behind these values.
+# BM25/VSM blend weight and BM25's k1/b -- kept as defaults here (not
+# re-exposed as score() parameters) so retrieve.py's call stays simple;
+# see the report for the grid search behind these values.
 #
-# _TITLE_WEIGHT is 0 despite grid-searching better on this corpus's dev
-# queries alone -- see the module docstring's "Title signal" section for
-# why that plateau didn't survive a cross-corpus check and was judged too
-# corpus-specific to trust on an unseen held-out set.
-_TITLE_WEIGHT = 0.0
 # 0.90/0.10, not this corpus's locally-optimal 0.75/0.25 -- see the module
 # docstring's "Blend weight" section: VSM's benefit here doesn't transfer
 # to a structurally different corpus (monotonically costs it instead), so
 # this is deliberately the best-summed-across-both point, not either
 # corpus's individual optimum.
-_BM25_WEIGHT = (1 - _TITLE_WEIGHT) * 0.90
-_VSM_WEIGHT = (1 - _TITLE_WEIGHT) * 0.10
+_BM25_WEIGHT = 0.90
+_VSM_WEIGHT = 0.10
 #
 # k1=1.60, b=0.50 (was k1=2.50, b=0.60): b controls how strongly document
 # length is normalised, and lowering it costs this corpus's dev nDCG@10
@@ -146,7 +139,7 @@ def _norm(value: Optional[float], lo: float, hi: float) -> float:
 
 def score(query: str, k: int) -> List[Tuple[str, float]]:
     """Return up to k (doc_id, score) pairs for `query`, ranked by a
-    normalised BM25+VSM+title blend, highest score first."""
+    normalised BM25+VSM blend, highest score first."""
     terms = tokenize(query)
     if not terms:
         return []
@@ -170,7 +163,6 @@ def score(query: str, k: int) -> List[Tuple[str, float]]:
     # cheaper than a module-global or an attribute chain (LOAD_GLOBAL /
     # LOAD_ATTR) re-walked on every one of those iterations.
     postings_get = _INDEX.postings.get
-    title_postings_get = _INDEX.title_postings.get
     doc_len_arr = _INDEX.doc_len  # doc_idx -> length, a list (see indexer.py)
     avg_doc_len = _INDEX.avg_doc_len
     k1, b = _K1, _B
@@ -221,27 +213,11 @@ def score(query: str, k: int) -> List[Tuple[str, float]]:
         if d_norm > 0:
             vsm_scores[doc_idx] = dot / (q_norm * d_norm)
 
-    # Title signal: simple term-overlap count against each document's
-    # title zone (indexer.py's title_postings) -- these postings lists are
-    # bounded by TITLE_ZONE_WORDS, so much cheaper than the main index.
-    # Skipped entirely when _TITLE_WEIGHT is 0 (its current default, see
-    # module docstring) -- no point walking title_postings for a term
-    # whose contribution is about to be multiplied by 0 anyway.
-    title_totals: Dict[int, float] = defaultdict(float)
-    if _TITLE_WEIGHT:
-        for term, count in term_counts.items():
-            tpost = title_postings_get(term)
-            if not tpost:
-                continue
-            for doc_idx, tf in tpost.items():
-                title_totals[doc_idx] += count * tf
-
     bm25_lo, bm25_hi = _minmax(bm25_totals)
     vsm_lo, vsm_hi = _minmax(vsm_scores)
-    title_lo, title_hi = _minmax(title_totals)
 
-    # Normalize inline instead of materializing three full-candidate-size
-    # dicts up front, and select the top k with a partial heap instead of
+    # Normalize inline instead of materializing full-candidate-size dicts
+    # up front, and select the top k with a partial heap instead of
     # sorting the whole (possibly near-corpus-size) candidate set -- same
     # (-score, doc_id) tie-break as a full sort would give, just O(n log k)
     # instead of O(n log n). doc_idx -> doc_id string conversion happens
@@ -249,19 +225,16 @@ def score(query: str, k: int) -> List[Tuple[str, float]]:
     # contract and the tie-break both need the real doc_id string, not the
     # index) -- everything upstream stays in cheaper int-keyed dicts.
     #
-    # candidate_docs is just bm25_totals's keys, not a 3-way set union:
-    # vsm_dot and title_totals are only ever populated for doc_idxs that
-    # bm25_totals already has an entry for (same _INDEX.postings[term]
-    # walk for VSM; the title zone is always a prefix of the same doc's
-    # full text, tokenized the same way, so any term in title_postings[t]
-    # is necessarily also in postings[t]) -- so both are always subsets.
+    # candidate_docs is just bm25_totals's keys, not a set union: vsm_dot
+    # is only ever populated for doc_idxs that bm25_totals already has an
+    # entry for (same _INDEX.postings[term] walk for both), so it's
+    # always a subset.
     doc_ids = _INDEX.doc_ids
     combined = (
         (
             doc_ids[doc_idx],
             _BM25_WEIGHT * _norm(raw_bm25, bm25_lo, bm25_hi)
-            + _VSM_WEIGHT * _norm(vsm_scores.get(doc_idx), vsm_lo, vsm_hi)
-            + _TITLE_WEIGHT * _norm(title_totals.get(doc_idx), title_lo, title_hi),
+            + _VSM_WEIGHT * _norm(vsm_scores.get(doc_idx), vsm_lo, vsm_hi),
         )
         for doc_idx, raw_bm25 in bm25_totals.items()
     )

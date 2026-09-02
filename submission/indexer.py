@@ -109,21 +109,6 @@ def tokenize(text: str) -> List[str]:
     return [_stem(tok) for tok in _TOKEN_RE.findall(text.lower()) if tok not in _STOPWORDS]
 
 
-# Number of leading whitespace-split words of each document's raw text
-# treated as an approximate "title" zone (submission/custom_scorer.py
-# weights matches here higher). Deliberately a fixed word count, not a
-# punctuation/sentence-boundary heuristic or a separate corpus field:
-# inspecting data/full/corpus.jsonl directly showed titles are merged
-# into `text` with no reliable delimiter (some end mid-sentence with no
-# punctuation at all before the abstract begins), and the documented
-# schema (data/README.md) guarantees only {"doc_id", "text"} -- the same
-# format the held-out corpus is promised to use -- so a separate title
-# field can't be assumed to exist there. A leading word count needs
-# neither. Value chosen via a grid search over word-count x blend-weight
-# against the full dev set (see custom_scorer.py's docstring).
-TITLE_ZONE_WORDS = 9
-
-
 def _pack_gaps(gaps: List[int]) -> Tuple[bytes, bytes, bytes]:
     """3-tier cascading pack: array('B') (0-254 direct, 255 = escape to
     the H tier) -> array('H') (0-65534 direct, 65535 = escape to the I
@@ -254,10 +239,9 @@ def _front_decode(prefix_lens_bytes: bytes, suffixes_blob: bytes) -> List[str]:
 def _encode_postings(
     postings: Dict[str, Dict[int, int]],
 ) -> Tuple[List[str], List[int], bytes, bytes, bytes, bytes, bytes]:
-    """Shared by save() for both self.postings and self.title_postings --
-    see save()'s and _pack_gaps'/_pack_tfs' docstrings for the encoding
-    scheme. Returns (terms, per-term posting counts, gaps L0/L1/L2 bytes,
-    tfs L0/L1 bytes).
+    """Used by save() to encode self.postings -- see save()'s and
+    _pack_gaps'/_pack_tfs' docstrings for the encoding scheme. Returns
+    (terms, per-term posting counts, gaps L0/L1/L2 bytes, tfs L0/L1 bytes).
 
     postings is already {term: {doc_idx: tf}} -- InvertedIndex.build()
     assigns each doc its integer index the moment it's first seen (see
@@ -337,12 +321,6 @@ class InvertedIndex:
         # only need that conversion once, when constructing their final
         # (doc_id, score) results, not on every posting.
         self.postings: Dict[str, Dict[int, int]] = {}
-        # term -> {doc_idx: term_freq}, restricted to each document's first
-        # TITLE_ZONE_WORDS words -- see TITLE_ZONE_WORDS' docstring above
-        # for why this (not a separate corpus field) is the title-zone
-        # source. Read by submission/custom_scorer.py for title-weighted
-        # scoring; bm25.py/boolean_vsm.py ignore it entirely.
-        self.title_postings: Dict[str, Dict[int, int]] = {}
         self.doc_ids: List[str] = []  # doc_idx -> doc_id
         self.doc_len: List[int] = []  # doc_idx -> number of tokens
         self.N: int = 0  # number of documents
@@ -352,15 +330,14 @@ class InvertedIndex:
         """corpus: list of (doc_id, text) pairs, e.g. from
         submission.corpus_utils.load_corpus().
 
-        Tokenizes each document, populates self.postings, self.title_postings,
-        self.doc_ids, self.doc_len, self.N, and self.avg_doc_len. Raw document
-        text is not retained — BM25/VSM only need term-frequency and length
+        Tokenizes each document, populates self.postings, self.doc_ids,
+        self.doc_len, self.N, and self.avg_doc_len. Raw document text is
+        not retained — BM25/VSM only need term-frequency and length
         statistics, and keeping it around would inflate the graded on-disk
         index size for no query-time benefit.
         """
         total_len = 0
         postings = self.postings
-        title_postings = self.title_postings
         doc_ids = self.doc_ids
         doc_len = self.doc_len
 
@@ -385,14 +362,6 @@ class InvertedIndex:
                 # separate membership check plus, on a new term, a second
                 # insert) followed by a third lookup to fetch it back.
                 postings.setdefault(term, {})[doc_idx] = count
-
-            # maxsplit stops after TITLE_ZONE_WORDS splits instead of
-            # splitting the whole (possibly long) document just to slice
-            # off the first few words -- identical result, cheaper for
-            # anything longer than the title zone itself.
-            title_zone_text = " ".join(text.split(maxsplit=TITLE_ZONE_WORDS)[:TITLE_ZONE_WORDS])
-            for term, count in Counter(tokenize(title_zone_text)).items():
-                title_postings.setdefault(term, {})[doc_idx] = count
 
         self.N = len(doc_ids)
         self.avg_doc_len = total_len / self.N if self.N > 0 else 0.0
@@ -441,43 +410,15 @@ class InvertedIndex:
              would be catastrophic for index-build-time; level 3 gives
              nearly all of the size win for a small, bounded time cost.
         """
-        # self.postings/self.title_postings are already {term: {doc_idx:
-        # tf}} (build() assigns doc_idx directly, see __init__/build()'s
-        # docstrings) -- no doc_id-to-index translation step needed here
-        # at all.
+        # self.postings is already {term: {doc_idx: tf}} (build() assigns
+        # doc_idx directly, see __init__/build()'s docstrings) -- no
+        # doc_id-to-index translation step needed here at all.
         terms, term_counts, gaps_l0, gaps_l1, gaps_l2, tfs_l0, tfs_l1 = _encode_postings(self.postings)
-        (
-            title_terms,
-            title_term_counts,
-            title_gaps_l0,
-            title_gaps_l1,
-            title_gaps_l2,
-            title_tfs_l0,
-            title_tfs_l1,
-        ) = _encode_postings(self.title_postings)
 
         # Front-code `terms` (sorted, so adjacent entries very often share
         # a long stemmed root) instead of storing each string in full --
         # see _front_code's docstring.
         term_prefix_lens, term_suffixes = _front_code(terms)
-
-        # title_postings' vocabulary is always a subset of self.postings'
-        # (the title zone is a prefix of the same document's full text,
-        # tokenized the same way -- see custom_scorer.py's docstring for
-        # the same invariant used there), so title_terms never needs its
-        # own strings at all: store where each one falls in the already-
-        # stored `terms` list instead, as gap-encoded (title vocabularies
-        # cluster near each other alphabetically far more than doc-idx
-        # gaps do) indices packed with the same cascade used for postings
-        # gaps above.
-        term_to_idx = {t: i for i, t in enumerate(terms)}
-        title_term_idx_gaps: List[int] = []
-        prev_idx = 0
-        for t in title_terms:
-            ti = term_to_idx[t]
-            title_term_idx_gaps.append(ti - prev_idx)
-            prev_idx = ti
-        title_idx_l0, title_idx_l1, title_idx_l2 = _pack_gaps(title_term_idx_gaps)
 
         payload = {
             "doc_ids": self.doc_ids,
@@ -492,15 +433,6 @@ class InvertedIndex:
             "gaps_l2": gaps_l2,
             "tfs_l0": tfs_l0,
             "tfs_l1": tfs_l1,
-            "title_idx_l0": title_idx_l0,
-            "title_idx_l1": title_idx_l1,
-            "title_idx_l2": title_idx_l2,
-            "title_term_counts": title_term_counts,
-            "title_gaps_l0": title_gaps_l0,
-            "title_gaps_l1": title_gaps_l1,
-            "title_gaps_l2": title_gaps_l2,
-            "title_tfs_l0": title_tfs_l0,
-            "title_tfs_l1": title_tfs_l1,
         }
         blob = zlib.compress(pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL), level=3)
 
@@ -537,29 +469,6 @@ class InvertedIndex:
             payload["gaps_l2"],
             payload["tfs_l0"],
             payload["tfs_l1"],
-        )
-
-        # Inverse of save()'s title-vocabulary encoding: title_terms was
-        # never stored as strings, only as gap-encoded indices into
-        # `terms` (title_postings' vocabulary is always a subset of
-        # self.postings', see save()'s comment there).
-        title_term_idx_gaps = _unpack_gaps(
-            payload["title_idx_l0"], payload["title_idx_l1"], payload["title_idx_l2"]
-        )
-        title_terms: List[str] = []
-        idx_pos = 0
-        for gap in title_term_idx_gaps:
-            idx_pos += gap
-            title_terms.append(terms[idx_pos])
-
-        idx.title_postings = _decode_postings(
-            title_terms,
-            payload["title_term_counts"],
-            payload["title_gaps_l0"],
-            payload["title_gaps_l1"],
-            payload["title_gaps_l2"],
-            payload["title_tfs_l0"],
-            payload["title_tfs_l1"],
         )
 
         return idx
