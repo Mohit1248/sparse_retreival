@@ -33,18 +33,29 @@ point versus pure BM25 on this corpus.
 Same problem as the title weight, though: that 0.75 peak was only ever
 checked against this one corpus. Cross-checked against a structurally
 different corpus, adding VSM weight *monotonically hurts* it at every
-level tested -- no peak, no compensating benefit anywhere, pure BM25 is
-that corpus's best point in the whole sweep. Not a full sign-flip like
-the title weight (VSM never actively helps this corpus, it just costs
-it by varying amounts), but a real, one-sided overfitting risk in the
-same family. Rather than either extreme -- 0.75 (locally optimal here,
-costs the other corpus the most) or dropping VSM entirely to 0.0/1.0
-(optimal for the other corpus specifically, which risks the same
-mistake in the opposite direction: fitting to that corpus's optimum
-instead of this one's), landed on 0.90/0.10 as the point that scores
-best summed across both rather than the best on either alone -- keeps
-most of this corpus's blend benefit while giving up little of the
-other's.
+level tested (at the k1/b then in use) -- no peak, no compensating
+benefit anywhere, pure BM25 was that corpus's best point in that sweep.
+First response to that was a compromise: 0.90/0.10, the point that
+scored best summed across both rather than either one's own optimum --
+still a real trade-off (this corpus's own peak was 0.75, the other
+corpus's was near 1.0, so 0.90 gave up some of both).
+
+k1/b, then blend weight, were tuned sequentially (one axis fixed while
+sweeping the other) up to that point -- a full joint grid over k1 x b x
+blend weight (125 combinations, screened cheaply on this corpus then the
+top 20 validated against the other) found a point that isn't a
+trade-off at all: k1=1.20, b=0.50, blend=0.80/0.20 improves BOTH
+corpora on BOTH nDCG@10 and MAP@10 simultaneously versus the sequential
+compromise (this corpus's nDCG@10 0.6658->0.6789; the other corpus's
+nDCG@10 0.2168->0.2191 and MAP@10 0.1197->0.1221, both measured on its
+full 2,426-query set, not just the smaller one used for the initial
+125-combo screen). Confirmed this isn't a hidden fit to either corpus by
+checking it against each one's own independently-found optimum: this
+corpus's own peak favors b=0.55 not 0.50 (0.6802 vs. this point's
+0.6789, a 0.2% difference) and the other corpus's own peak favors a much
+lower k1 (~0.7-0.9), lower b (~0.35-0.45), and close to pure BM25
+(~0.97-1.0 weight) -- this point sits clearly away from both, not
+parked at either one's corner.
 
 Title signal (tried, removed): an earlier version added a third component
 scoring term overlap with each document's first few words as an
@@ -85,25 +96,15 @@ _INDEX: Optional[InvertedIndex] = None
 # re-exposed as score() parameters) so retrieve.py's call stays simple;
 # see the report for the grid search behind these values.
 #
-# 0.90/0.10, not this corpus's locally-optimal 0.75/0.25 -- see the module
-# docstring's "Blend weight" section: VSM's benefit here doesn't transfer
-# to a structurally different corpus (monotonically costs it instead), so
-# this is deliberately the best-summed-across-both point, not either
-# corpus's individual optimum.
-_BM25_WEIGHT = 0.90
-_VSM_WEIGHT = 0.10
-#
-# k1=1.60, b=0.50 (was k1=2.50, b=0.60): b controls how strongly document
-# length is normalised, and lowering it costs this corpus's dev nDCG@10
-# only ~2% while meaningfully helping a structurally different, more
-# uniform-length corpus used as a cross-corpus check -- moving to it was a
-# net improvement on the SUM of both corpora's nDCG@10, not just a
-# compromise. k1 alone showed no comparable cross-corpus benefit; b is the
-# axis that matters here. Kept, unlike the title weight above, because
-# this is a smooth trade-off curve (no sign flip), not a fit that reverses
-# outright -- 1.60/0.50 is simply a better point on that curve for
-# performing acceptably on both rather than optimally on only one.
-_K1 = 1.60
+# k1=1.20, b=0.50, blend=0.80/0.20 -- found via a full joint grid over all
+# three parameters together (not swept one at a time), then verified to
+# improve nDCG@10 AND MAP@10 on BOTH corpora simultaneously versus the
+# earlier sequentially-tuned point, and to sit clearly away from either
+# corpus's own independently-found optimum (not fit to either one) -- see
+# the module docstring's "Blend weight" section for the full numbers.
+_BM25_WEIGHT = 0.80
+_VSM_WEIGHT = 0.20
+_K1 = 1.20
 _B = 0.50
 
 
