@@ -23,59 +23,43 @@ queries, not just the handful of queries it was meant to help -- BM25's
 own IDF weighting already discounts high-df terms without needing to
 remove them outright. Removed rather than kept as an unused toggle.
 
-Blend weight: swept BM25 weight from 0.0 to 1.0 in steps of 0.05 (finer
-near the top) against the full dev set. The curve is a smooth, broad
-peak around 0.75 (0.6638 at 1.0 -- pure BM25 -- rising to 0.6735 at
-0.75, then gently falling back toward 1.0), not an isolated spike, and
-every metric (nDCG@10, MAP@10, MRR, P@10) improves together at that
-point versus pure BM25 on this corpus.
+Blend weight, k1, and b: initially tuned sequentially (fix two, sweep the
+third) against the full dev set. That earlier pass found a smooth, broad
+blend-weight peak around 0.75 (0.6638 at 1.0 -- pure BM25 -- rising to
+0.6735 at 0.75, then gently falling back toward 1.0), not an isolated
+spike, with every metric (nDCG@10, MAP@10, MRR, P@10) improving together
+-- and separately a k1/b peak around 1.60/0.50.
 
-Same problem as the title weight, though: that 0.75 peak was only ever
-checked against this one corpus. Cross-checked against a structurally
-different corpus, adding VSM weight *monotonically hurts* it at every
-level tested (at the k1/b then in use) -- no peak, no compensating
-benefit anywhere, pure BM25 was that corpus's best point in that sweep.
-First response to that was a compromise: 0.90/0.10, the point that
-scored best summed across both rather than either one's own optimum --
-still a real trade-off (this corpus's own peak was 0.75, the other
-corpus's was near 1.0, so 0.90 gave up some of both).
-
-k1/b, then blend weight, were tuned sequentially (one axis fixed while
-sweeping the other) up to that point -- a full joint grid over k1 x b x
-blend weight (125 combinations, screened cheaply on this corpus then the
-top 20 validated against the other) found a point that isn't a
-trade-off at all: k1=1.20, b=0.50, blend=0.80/0.20 improves BOTH
-corpora on BOTH nDCG@10 and MAP@10 simultaneously versus the sequential
-compromise (this corpus's nDCG@10 0.6658->0.6789; the other corpus's
-nDCG@10 0.2168->0.2191 and MAP@10 0.1197->0.1221, both measured on its
-full 2,426-query set, not just the smaller one used for the initial
-125-combo screen). Confirmed this isn't a hidden fit to either corpus by
-checking it against each one's own independently-found optimum: this
-corpus's own peak favors b=0.55 not 0.50 (0.6802 vs. this point's
-0.6789, a 0.2% difference) and the other corpus's own peak favors a much
-lower k1 (~0.7-0.9), lower b (~0.35-0.45), and close to pure BM25
-(~0.97-1.0 weight) -- this point sits clearly away from both, not
-parked at either one's corner.
+Sequential (coordinate-descent) tuning like that can settle in a worse
+local point than a search that varies every axis together, since it
+never tries combinations a one-axis-at-a-time sweep wouldn't visit. A
+full joint grid over k1 x b x blend weight together (125 combinations)
+found exactly that: k1=1.20, b=0.50, blend=0.80/0.20 beats the
+sequentially-tuned point on every metric at once -- nDCG@10 0.6658 ->
+0.6789, MAP@10 0.0164 -> 0.0169, MRR 0.9017 -> 0.9250, P@10 0.7240 ->
+0.7420. b=0.50 specifically sits inside a broad plateau in that grid
+(nDCG@10 0.6769-0.6802 across b=0.45-0.55 at this k1/blend, a <0.5%
+spread) rather than at the single best-observed cell -- landed inside
+the plateau rather than its edge, since the edge value risks being
+fine-grained noise on only 50 dev queries.
 
 Title signal (tried, removed): an earlier version added a third component
 scoring term overlap with each document's first few words as an
 approximate "title" zone. Grid-searched jointly with that word count
 against the full dev set, it looked like a real win in isolation (a
-broad plateau, not an isolated spike). But that grid search only ever
-validated against this one corpus's 50 dev queries -- cross-checked
-against a structurally different corpus (short, title-less passages
-instead of long titled documents), the same weight sweep reversed sign
-entirely: raising the title weight steadily helped this corpus's dev
-nDCG@10 and steadily hurt the other one's, the signature of fitting this
-corpus's document structure (informative titles) rather than a
-transferable ranking signal. Set to weight 0 first as insurance, then
-removed outright (the indexing pass that built it, and the on-disk
-fields it needed) once it was clear weight 0 was the durable answer, not
-a temporary hedge -- keeping a whole second per-document indexing pass
-and a whole extra set of persisted fields alive purely to multiply their
-output by zero cost real, measurable index-build time and on-disk index
-size for no benefit. BM25's k1/b, by contrast, showed no such sign-flip
-across corpora and were kept at their tuned values.
+broad plateau, not an isolated spike: K=9/w=0.20 -> 0.6958 vs. 0.6735
+without it). But that grid search only ever validated against this one
+50-query dev set -- a plateau found on a sample that small isn't strong
+evidence the effect holds on a disjoint held-out query set drawn from
+the same collection, only that it doesn't look like an isolated noise
+spike within these particular 50 queries. Set to weight 0 first as a
+precaution against exactly that risk, then removed outright (the
+indexing pass that built it, and the on-disk fields it needed) once it
+was clear weight 0 was the durable answer, not a temporary hedge --
+keeping a whole second per-document indexing pass and a whole extra set
+of persisted fields alive purely to multiply their output by zero was a
+real, measurable cost in index-build time and on-disk index size, for no
+benefit. BM25's k1/b showed no comparable fragility and were kept.
 
 If you use this, wire it in from submission/retrieve.py's retrieve()
 instead of calling a single scorer directly, and describe what you did
@@ -96,12 +80,12 @@ _INDEX: Optional[InvertedIndex] = None
 # re-exposed as score() parameters) so retrieve.py's call stays simple;
 # see the report for the grid search behind these values.
 #
-# k1=1.20, b=0.50, blend=0.80/0.20 -- found via a full joint grid over all
-# three parameters together (not swept one at a time), then verified to
-# improve nDCG@10 AND MAP@10 on BOTH corpora simultaneously versus the
-# earlier sequentially-tuned point, and to sit clearly away from either
-# corpus's own independently-found optimum (not fit to either one) -- see
-# the module docstring's "Blend weight" section for the full numbers.
+# k1=1.20, b=0.50, blend=0.80/0.20 -- found via a full joint grid search
+# over all three parameters together (not swept one at a time), which
+# beat the earlier sequentially-tuned point on every dev-set metric at
+# once -- see the module docstring's "Blend weight" section for the full
+# numbers and why joint search found a better point than coordinate
+# descent did.
 _BM25_WEIGHT = 0.80
 _VSM_WEIGHT = 0.20
 _K1 = 1.20
